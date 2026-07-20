@@ -128,11 +128,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Durable monthly cap (survives restarts). Bounded overshoot under high
-	// concurrency is acceptable for a soft quota and further limited by the
-	// burst check below.
-	if monthCount >= freeMonthlyLimit {
-		http.Error(w, "You've reached the free-tier limit of 10,000 requests this month — that usually means real traffic 🎉. Upgrade in your dashboard to lift the cap.", http.StatusTooManyRequests)
+	// Durable monthly cap (survives restarts), disabled when set to 0. Bounded
+	// overshoot under high concurrency is acceptable for a soft quota and
+	// further limited by the burst check below.
+	if monthlyLimit > 0 && monthCount >= monthlyLimit {
+		http.Error(w, "monthly request limit reached", http.StatusTooManyRequests)
 		return
 	}
 
@@ -330,10 +330,11 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 
 // requireEnv fails startup if any of the given environment variables are
 // unset, so a misconfigured deployment is caught immediately instead of
-// surfacing later as a confusing failure. ANTHROPIC_API_KEY and
-// OPENAI_API_KEY are validated here but not otherwise used by the proxy:
-// each client request still carries its own provider auth header, which is
-// forwarded upstream unchanged.
+// surfacing later as a confusing failure.
+//
+// Note that no provider API key is required, or read anywhere in this
+// program. Each client request carries its own provider auth header, which is
+// forwarded upstream unchanged; the proxy never holds a key of its own.
 func requireEnv(names ...string) {
 	var missing []string
 	for _, name := range names {
@@ -355,7 +356,7 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		slog.Info("no .env file found; relying on the process environment")
 	}
-	requireEnv("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+	requireEnv("DATABASE_URL")
 
 	// Optional override of the request body size cap.
 	if v := os.Getenv("MAX_REQUEST_BYTES"); v != "" {
@@ -365,6 +366,16 @@ func main() {
 			os.Exit(1)
 		}
 		maxRequestBytes = n
+	}
+
+	// Optional override of the monthly per-project cap; 0 disables it.
+	if v := os.Getenv("MONTHLY_REQUEST_LIMIT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			slog.Error("invalid MONTHLY_REQUEST_LIMIT; must be a non-negative integer", "value", v)
+			os.Exit(1)
+		}
+		monthlyLimit = n
 	}
 
 	var err error

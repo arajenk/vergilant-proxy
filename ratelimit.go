@@ -22,10 +22,10 @@ const (
 	refillPerSecond = 10 // sustained requests/second once the burst is spent
 )
 
-// freeMonthlyLimit is the durable free-tier cap enforced against the Postgres
-// month count (see projectStatus in db.go). It's written as a plain limit so
-// day 13 can lift it for paid projects once a paid flag exists.
-const freeMonthlyLimit = 10000
+// monthlyLimit is the durable per-project cap enforced against the Postgres
+// month count (see projectStatus in db.go). Set MONTHLY_REQUEST_LIMIT to
+// change it, or to 0 to disable the cap entirely; main sets it at startup.
+var monthlyLimit int = 10000
 
 // bucket is one project's token balance. tokens is fractional so a partial
 // refill between requests isn't rounded away.
