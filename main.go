@@ -52,7 +52,7 @@ type requestBody struct {
 	Model string `json:"model"`
 }
 
-// Usage carries both providers' field names for the same two numbers —
+// Usage carries both providers' field names for the same two numbers.
 // Anthropic and OpenAI never populate the same pair, so tokens() below just
 // returns whichever pair is non-zero.
 type responseBody struct {
@@ -139,7 +139,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// In-memory burst guardrail against a single project hammering us.
 	if !rl.allow(projectKey) {
 		w.Header().Set("Retry-After", "1")
-		http.Error(w, "too many requests — slow down", http.StatusTooManyRequests)
+		http.Error(w, "too many requests, slow down", http.StatusTooManyRequests)
 		return
 	}
 
@@ -338,7 +338,7 @@ func requireEnv(names ...string) {
 		}
 	}
 	if len(missing) > 0 {
-		slog.Error("missing required environment variable(s) — set them in the environment or in a .env file", "missing", strings.Join(missing, ", "))
+		slog.Error("missing required environment variable(s); set them in the environment or in a .env file", "missing", strings.Join(missing, ", "))
 		os.Exit(1)
 	}
 }
@@ -401,7 +401,7 @@ func main() {
 
 	// Fly (and most platforms) send SIGTERM on deploy/stop. Shutdown stops
 	// accepting new connections and waits up to the grace period for in-flight
-	// requests — including long-lived streams — to finish before we exit.
+	// requests, including long-lived streams, to finish before we exit.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()

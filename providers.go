@@ -8,8 +8,8 @@ import (
 
 // providers maps the proxy path prefix a client uses (e.g. /openai/...) to
 // the upstream API it forwards to. Adding a provider means adding one entry
-// here, its price-map rows in db.go, and — if it streams — an SSE line
-// parser alongside the two below.
+// here, its price-map rows in db.go, and an SSE line parser alongside the
+// two below if it streams.
 var providers = map[string]string{
 	"anthropic": "https://api.anthropic.com",
 	"openai":    "https://api.openai.com",

@@ -7,7 +7,7 @@ import (
 
 // Rate-limiting has two independent layers, doing two different jobs:
 //
-//  1. The monthly per-project cap lives in Postgres, counted in db.go — it's a
+//  1. The monthly per-project cap lives in Postgres, counted in db.go. It's a
 //     durable quota that MUST survive a restart, so it can't be in memory.
 //     See monthlyLimit / projectStatus.
 //  2. The per-project token bucket below is an in-memory abuse guardrail: it
@@ -16,7 +16,8 @@ import (
 //     this state on restart is harmless, so in-memory is the right home.
 //
 // These are guardrails against pathological bursts, NOT the customer-facing
-// usage limit — set generously so normal bursty traffic sails through.
+// usage limit, and they're set generously so normal bursty traffic sails
+// through.
 const (
 	burstSize       = 30 // max requests a project can fire back-to-back
 	refillPerSecond = 10 // sustained requests/second once the burst is spent
@@ -36,7 +37,7 @@ type bucket struct {
 
 // limiter holds one bucket per project key. The map only ever gets entries for
 // keys that already passed validation (allow is called after projectStatus),
-// so it's bounded by the number of real projects — no reaper needed, and a
+// so it's bounded by the number of real projects. No reaper needed, and a
 // flood of garbage keys can't grow it.
 type limiter struct {
 	mu      sync.Mutex

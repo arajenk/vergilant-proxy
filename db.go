@@ -19,7 +19,7 @@ type modelPrice struct {
 // ($2/$10 per million) through 2026-08-31; it reverts to $3/$15 after.
 //
 // The OpenAI rows below are current as of this author's knowledge cutoff
-// (January 2026), not verified against OpenAI's live pricing page — check
+// (January 2026), not verified against OpenAI's live pricing page. Check
 // https://openai.com/api/pricing before relying on them for real billing.
 var priceMap = map[string]modelPrice{
 	"claude-opus-4-8":           {InputPerMillion: 5, OutputPerMillion: 25},
@@ -75,8 +75,9 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 // single round-trip on the hot path: does this key exist, and how many requests
 // has it already made this calendar month (for the durable free-tier cap).
 //
-// The month count is derived from the requests table itself — the single source
-// of truth — rather than a separate counter, so there's nothing to keep in sync.
+// The month count is derived from the requests table itself, the single
+// source of truth, rather than a separate counter, so there's nothing to
+// keep in sync.
 // The (project_key, timestamp) index in schema.sql keeps this a cheap range
 // count. now() is UTC in Postgres, so date_trunc gives a UTC month boundary.
 func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (exists bool, monthCount int, err error) {
