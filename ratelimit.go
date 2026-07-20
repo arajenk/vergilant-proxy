@@ -7,13 +7,13 @@ import (
 
 // Rate-limiting has two independent layers, doing two different jobs:
 //
-//   1. The monthly free-tier cap (10k requests/month) lives in Postgres, in
-//      db.go — it's a durable quota that MUST survive a restart, so it can't
-//      be in memory. See freeMonthlyLimit / projectStatus.
-//   2. The per-project token bucket below is an in-memory abuse guardrail: it
-//      stops a single project (e.g. a runaway agent looping thousands of times
-//      a second) from hammering our DB and the upstream provider. Losing this
-//      state on restart is harmless, so in-memory is the right home for it.
+//  1. The monthly per-project cap lives in Postgres, counted in db.go — it's a
+//     durable quota that MUST survive a restart, so it can't be in memory.
+//     See monthlyLimit / projectStatus.
+//  2. The per-project token bucket below is an in-memory abuse guardrail: it
+//     stops a single project (e.g. a runaway agent looping thousands of times
+//     a second) from hammering the database and the upstream provider. Losing
+//     this state on restart is harmless, so in-memory is the right home.
 //
 // These are guardrails against pathological bursts, NOT the customer-facing
 // usage limit — set generously so normal bursty traffic sails through.
