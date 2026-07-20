@@ -84,9 +84,9 @@ type logEntry struct {
 	FirstTokenMs int64  `json:"first_token_ms,omitempty"`
 }
 
-// logRequest emits one request's metadata as a structured log line. It is the
-// only place per-request info is logged, and by construction carries metadata
-// only — never request or response bodies (CLAUDE.md).
+// logRequest emits one request's metadata as a structured log line. It's the
+// only place per-request info gets logged, and it only ever takes metadata,
+// never bodies.
 func logRequest(e logEntry) {
 	slog.Info("request",
 		"method", e.Method,
@@ -232,9 +232,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// saveFailure persists a request record for a proxy-level failure (bad
-// request body, unreachable upstream, etc.) that never reaches the normal
-// success logging above — these previously went unrecorded entirely.
+// saveFailure records a proxy-level failure (bad request body, unreachable
+// upstream, etc.) that never reaches the success path above.
 func saveFailure(r *http.Request, projectKey, provider string, start time.Time, model string, status int, errMsg string) {
 	rec := requestRecord{
 		ProjectKey: projectKey,
@@ -250,15 +249,11 @@ func saveFailure(r *http.Request, projectKey, provider string, start time.Time, 
 	}
 }
 
-// streamResponse passes an SSE (text/event-stream) response through to the
-// client one line at a time, flushing after every write so the client sees
-// tokens as they arrive instead of waiting for the whole response. Alongside
-// that passthrough it watches the same bytes to recover token counts and
-// first-token latency, since streaming responses spread that information
-// across multiple events instead of one JSON object like non-streaming does.
-// The two providers' SSE framing differs enough (event-typed vs. bare data
-// chunks) that parsing a line is dispatched to a per-provider function
-// rather than one parser branching throughout.
+// streamResponse passes an SSE response through to the client one line at a
+// time, flushing after every write so tokens show up as they arrive instead
+// of after the whole response lands. Alongside the passthrough it watches the
+// same bytes to recover token counts and first-token latency, since that info
+// is spread across multiple events instead of sitting in one JSON object.
 func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, reqParsed requestBody, projectKey, provider string) {
 	for k, v := range resp.Header {
 		w.Header()[k] = v
@@ -358,7 +353,6 @@ func main() {
 	}
 	requireEnv("DATABASE_URL")
 
-	// Optional override of the request body size cap.
 	if v := os.Getenv("MAX_REQUEST_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
@@ -368,7 +362,7 @@ func main() {
 		maxRequestBytes = n
 	}
 
-	// Optional override of the monthly per-project cap; 0 disables it.
+	// 0 disables the cap.
 	if v := os.Getenv("MONTHLY_REQUEST_LIMIT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {

@@ -77,11 +77,10 @@ func parseAnthropicSSELine(text string, currentEvent *string, inputTokens, outpu
 
 // parseOpenAISSELine updates the running token counts and first-token time
 // from one line of an OpenAI chat-completions SSE stream. Unlike Anthropic,
-// OpenAI has no "event:" line — every line is a bare "data: {...}" chunk,
-// terminated by a final "data: [DONE]". Usage only appears in the last
-// chunk, and only if the request set stream_options.include_usage; requests
-// that don't set it will show zero tokens for a streamed response, same as
-// any other unparseable body elsewhere in this file.
+// OpenAI has no "event:" line, every line is a bare "data: {...}" chunk,
+// terminated by a final "data: [DONE]". Usage only shows up in the last
+// chunk, and only if the request set stream_options.include_usage, so
+// requests that skip it just show zero tokens for a streamed response.
 func parseOpenAISSELine(text string, inputTokens, outputTokens *int, firstTokenAt *time.Time) {
 	if !strings.HasPrefix(text, "data:") {
 		return

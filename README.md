@@ -1,10 +1,10 @@
 # vergilant-proxy
 
-The proxy that runs Vergilant. It sits in front of the Anthropic and OpenAI
-APIs, forwards your requests upstream untouched, and records what happened:
-model, status, latency, token counts, estimated cost.
+This is the proxy that runs Vergilant. It sits in front of the Anthropic and
+OpenAI APIs, forwards your requests upstream untouched, and logs what
+happened: model, status, latency, token counts, estimated cost.
 
-It does not record your prompts or the model's replies.
+It does not log your prompts or the model's replies. That's the whole point.
 
 ```sh
 # before
@@ -17,55 +17,59 @@ curl https://your-proxy/anthropic/v1/messages \
   -H "X-Monitor-Key: your-project-key" ...
 ```
 
-Same request, same response, same streaming behaviour. The path gains a
-`/anthropic` or `/openai` prefix and the request gains one header.
+Same request, same response, same streaming behavior. You just add a
+`/anthropic` or `/openai` prefix to the path and one extra header.
 
-## Why this is open source
+## Why open source
 
-Vergilant's pitch is that we see your metadata and never your data. That is a
-claim about code you can't see, made by a company that would benefit from
-shading it. So here is the code.
+Vergilant's whole pitch is "we see your metadata, never your data." That's an
+easy thing to say and a hard thing to prove, especially from a company that'd
+benefit from fudging it a little. So instead of asking you to take our word
+for it, here's the code.
 
-Be precise about what the claim is, because the precision is the point:
+I want to be precise about the claim, because the precision is the point.
+Request and response bodies pass through this proxy in memory. They have to,
+it's a proxy. They're gone as soon as the response finishes. They're never
+written to the database, never written to the logs.
 
-- Request and response bodies **pass through this proxy in memory**. They have
-  to — it's a proxy. They are gone when the response finishes.
-- They are **never written to the database and never written to the logs**.
+The claim is "never stored, never logged." It is not "never touches our
+servers." Anyone telling you that about a proxy is either confused or lying to
+you.
 
-The claim is *never stored, never logged*. It is **not** "never touches our
-servers" — anyone telling you that about a proxy is confused or lying.
+### Where to check, if you don't believe me
 
-### Where to check
+You don't need to read the whole thing. Three spots decide whether this claim
+actually holds:
 
-You don't need to read all of it. Three places decide whether the claim holds:
+- `logRequest` in `main.go`, the only place in the program that logs anything
+  per-request. It takes a `logEntry` struct with a fixed set of fields and
+  hands them to `slog` one at a time. There's no `body` field on that struct,
+  and nothing logs `reqBytes` or `respBytes`.
+- `saveRequest` in `db.go`, the only `INSERT` in the codebase. The column list
+  is spelled out by hand, eleven columns, none of them hold content.
+- `schema.sql`, the table those columns land in. There's nowhere to even put a
+  body if some future change tried to sneak one in.
 
-- **`logRequest` in `main.go`** — the only function in the program that logs
-  anything per-request. It takes a `logEntry` struct with fixed fields and
-  passes them to `slog` one by one. There is no `body` field on the struct, and
-  no code path that logs `reqBytes` or `respBytes`.
-- **`saveRequest` in `db.go`** — the only `INSERT`. Its column list is written
-  out literally, eleven columns, none of which hold content.
-- **`schema.sql`** — the table those columns go into. There is nowhere to put a
-  body even if some future line of code tried.
-
-The bodies exist as `reqBytes` and `respBytes` in `handler`. Grep for them: they
-are read, parsed for `model` and `usage` token counts, forwarded, and dropped.
-That's the whole lifecycle, and it's about thirty lines.
+The bodies do exist, briefly, as `reqBytes` and `respBytes` in `handler`. Grep
+for them if you want: they get read, parsed for `model` and token usage,
+forwarded upstream, and dropped. That's the entire lifecycle and it's about
+thirty lines of code.
 
 Streaming works the same way. `streamResponse` writes each SSE line straight
-through to your client and *then* parses a local copy to pull token counts and
-time-to-first-token. It never buffers the stream to disk or anywhere else.
+through to your client, then parses its own local copy afterward to pull token
+counts and time-to-first-token. Nothing gets buffered to disk or anywhere
+else.
 
 ### It doesn't hold your provider keys either
 
-The proxy has no Anthropic or OpenAI credentials of its own. Your `x-api-key` /
-`Authorization` header rides along on each request and is forwarded upstream
-unchanged. There is no environment variable for a provider key, because nothing
+The proxy has no Anthropic or OpenAI credentials of its own. Your `x-api-key`
+/ `Authorization` header just rides along on the request and gets forwarded
+upstream unchanged. There's no env var for a provider key because nothing ever
 reads one.
 
 ## Running it
 
-You need Postgres and Go 1.26+.
+You'll need Postgres and Go 1.26+.
 
 ```sh
 createdb vergilant
@@ -75,47 +79,51 @@ psql vergilant -c "INSERT INTO projects (key, name) VALUES ('dev-key', 'local')"
 DATABASE_URL="postgres://localhost/vergilant" go run .
 ```
 
-It listens on `:8080`. Send it a request with `X-Monitor-Key: dev-key` and a
-row shows up in `requests`.
+It listens on `:8080`. Send it a request with `X-Monitor-Key: dev-key` and
+you'll see a row show up in `requests`.
 
 ### Configuration
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `DATABASE_URL` | yes | — | Postgres connection string. |
-| `MONTHLY_REQUEST_LIMIT` | no | `10000` | Requests per project per calendar month. `0` disables the cap. |
-| `MAX_REQUEST_BYTES` | no | `26214400` (25 MiB) | Largest request body accepted. |
+| `DATABASE_URL` | yes | | Postgres connection string. |
+| `MONTHLY_REQUEST_LIMIT` | no | `10000` | Requests per project per calendar month. Set to `0` to disable the cap. |
+| `MAX_REQUEST_BYTES` | no | `26214400` (25 MiB) | Largest request body it'll accept. |
 
-A `.env` file in the working directory is loaded if present.
+Drop a `.env` file in the working directory and it'll get picked up
+automatically.
 
-There is also an in-memory per-project token bucket (30 burst, 10/sec sustained)
-as an abuse guardrail. It's in `ratelimit.go` as constants; edit them if your
-traffic shape is different.
+There's also an in-memory per-project rate limiter (30 burst, 10/sec
+sustained) as a basic abuse guardrail. It lives in `ratelimit.go` as plain
+constants, so just edit them if your traffic looks different.
 
 ### Adding a provider
 
 Add an entry to `providers` in `providers.go`, add the model's prices to
-`priceMap` in `db.go`, and — if it streams — write an SSE line parser next to
-the two that are there. Nothing else is provider-aware.
+`priceMap` in `db.go`, and if it streams, write an SSE line parser next to the
+two already there. That's it, nothing else in the codebase cares which
+provider you're talking to.
 
-Note that `priceMap` is maintained by hand and models not listed in it record a
-cost of zero rather than a wrong guess.
+One note: `priceMap` is maintained by hand. Models that aren't listed in it
+record a cost of `0` instead of a guess, on purpose. A wrong number is worse
+than a missing one.
 
-## Relationship to hosted Vergilant
+## How this relates to hosted Vergilant
 
-This is the real proxy, not a reduced sample. It is mirrored out of the private
-monorepo that also holds the dashboard and the alerting engine, so what you read
-here is what serves production traffic.
+This isn't a stripped-down demo version, it's the real thing. It's mirrored
+out of the private monorepo that also has the dashboard and alerting engine,
+so what you're reading here is what actually serves production traffic.
 
-Hosted Vergilant is this plus a dashboard over those `requests` rows and an
-alert engine that pings you on Discord when error rates spike, spend jumps, or
-your traffic goes silent. If you'd rather run the proxy yourself and query the
-table directly, that works and is a supported thing to do.
+Hosted Vergilant is this proxy plus a dashboard over the `requests` table and
+an alert engine that pings you on Discord when error rates spike, spend
+jumps, or your traffic goes quiet. If you'd rather self-host and just query
+the table yourself, that's a perfectly normal thing to do and it's supported.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Short version: issues and PRs welcome,
-but this repo is a mirror, so merges land upstream first and flow back here.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Short version: issues and PRs are
+welcome, but this repo is a mirror, so changes land upstream first and flow
+back here.
 
 ## License
 

@@ -53,10 +53,8 @@ func newLimiter(rate, burst float64) *limiter {
 	}
 }
 
-// allow reports whether the given project may make one more request right now,
-// spending a token if so. It refills the bucket based on how long it's been
-// since that project's last request, caps the balance at burst, then takes a
-// token if one is available.
+// allow reports whether the project may make one more request right now,
+// spending a token if so.
 func (l *limiter) allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -64,13 +62,11 @@ func (l *limiter) allow(key string) bool {
 	now := time.Now()
 	b := l.buckets[key]
 	if b == nil {
-		// First request from this project this process has seen: start full so
-		// a fresh project isn't throttled before it's done anything.
+		// Start full so a fresh project isn't throttled before it's done anything.
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	}
 
-	// Refill by the time elapsed since the last request, never above burst.
 	b.tokens += now.Sub(b.last).Seconds() * l.rate
 	if b.tokens > l.burst {
 		b.tokens = l.burst
