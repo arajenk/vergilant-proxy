@@ -13,6 +13,10 @@ CREATE TABLE requests (
     error              TEXT
 );
 
+-- Serves both the proxy's per-project monthly-usage count (rate limiting) and
+-- the alert engine's per-project time-window queries.
+CREATE INDEX idx_requests_project_time ON requests (project_key, timestamp);
+
 CREATE TABLE projects (
     id         BIGSERIAL PRIMARY KEY,
     key        TEXT NOT NULL UNIQUE,

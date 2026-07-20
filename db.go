@@ -71,12 +71,23 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-func projectKeyExists(ctx context.Context, pool *pgxpool.Pool, key string) (bool, error) {
-	var exists bool
-	err := pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM projects WHERE key = $1)`, key,
-	).Scan(&exists)
-	return exists, err
+// projectStatus answers the two things the proxy needs before forwarding, in a
+// single round-trip on the hot path: does this key exist, and how many requests
+// has it already made this calendar month (for the durable free-tier cap).
+//
+// The month count is derived from the requests table itself — the single source
+// of truth — rather than a separate counter, so there's nothing to keep in sync.
+// The (project_key, timestamp) index in schema.sql keeps this a cheap range
+// count. now() is UTC in Postgres, so date_trunc gives a UTC month boundary.
+func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (exists bool, monthCount int, err error) {
+	err = pool.QueryRow(ctx, `
+		SELECT
+			EXISTS(SELECT 1 FROM projects WHERE key = $1),
+			(SELECT count(*) FROM requests
+			   WHERE project_key = $1 AND timestamp >= date_trunc('month', now()))`,
+		key,
+	).Scan(&exists, &monthCount)
+	return exists, monthCount, err
 }
 
 func saveRequest(ctx context.Context, pool *pgxpool.Pool, rec requestRecord) error {

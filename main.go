@@ -5,11 +5,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,6 +22,31 @@ import (
 )
 
 var pool *pgxpool.Pool
+
+// rl is the in-memory per-project burst limiter (see ratelimit.go). The
+// authoritative monthly cap is enforced separately against Postgres.
+var rl = newLimiter(refillPerSecond, burstSize)
+
+// maxRequestBytes caps the request body we'll read and forward. LLM requests
+// can be large (long context, base64 images), so the default is generous;
+// override with MAX_REQUEST_BYTES. Set in main from the environment.
+var maxRequestBytes int64 = 25 << 20 // 25 MiB
+
+// httpClient forwards requests upstream. The timeouts are on the Transport, not
+// the Client: Client.Timeout would cap the whole request including reading the
+// body, which for a long-lived SSE stream would truncate it mid-response.
+// ResponseHeaderTimeout instead bounds only how long we wait for the upstream
+// to START responding, leaving streaming bodies free to run as long as needed.
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
 
 type requestBody struct {
 	Model string `json:"model"`
@@ -54,6 +84,23 @@ type logEntry struct {
 	FirstTokenMs int64  `json:"first_token_ms,omitempty"`
 }
 
+// logRequest emits one request's metadata as a structured log line. It is the
+// only place per-request info is logged, and by construction carries metadata
+// only — never request or response bodies (CLAUDE.md).
+func logRequest(e logEntry) {
+	slog.Info("request",
+		"method", e.Method,
+		"path", e.Path,
+		"model", e.Model,
+		"status", e.Status,
+		"latency_ms", e.LatencyMs,
+		"input_tokens", e.InputTokens,
+		"output_tokens", e.OutputTokens,
+		"streamed", e.Streamed,
+		"first_token_ms", e.FirstTokenMs,
+	)
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	projectKey := r.Header.Get("X-Monitor-Key")
@@ -66,22 +113,45 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rejected requests are not saved: an unknown key can't be attributed to
-	// a project, and storing arbitrary client-supplied strings would pollute
-	// the requests table.
-	known, err := projectKeyExists(r.Context(), pool, projectKey)
+	// One round-trip validates the key and fetches this month's request count
+	// for the free-tier cap. Rejected requests below are not saved: an unknown
+	// key can't be attributed to a project, and a request we refuse never
+	// reaches the upstream, so there's no metadata to record.
+	exists, monthCount, err := projectStatus(r.Context(), pool, projectKey)
 	if err != nil {
-		log.Println("failed to validate project key:", err)
+		slog.Error("failed to validate project key", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if !known {
+	if !exists {
 		http.Error(w, "unknown project key", http.StatusUnauthorized)
 		return
 	}
 
+	// Durable monthly cap (survives restarts). Bounded overshoot under high
+	// concurrency is acceptable for a soft quota and further limited by the
+	// burst check below.
+	if monthCount >= freeMonthlyLimit {
+		http.Error(w, "You've reached the free-tier limit of 10,000 requests this month — that usually means real traffic 🎉. Upgrade in your dashboard to lift the cap.", http.StatusTooManyRequests)
+		return
+	}
+
+	// In-memory burst guardrail against a single project hammering us.
+	if !rl.allow(projectKey) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many requests — slow down", http.StatusTooManyRequests)
+		return
+	}
+
+	// Cap how much we'll read so an oversized body can't exhaust memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	reqBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		saveFailure(r, projectKey, provider, start, "", http.StatusBadRequest, "failed to read request body")
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		return
@@ -104,7 +174,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// resp.Body as raw gzip bytes.
 	proxyReq.Header.Set("Accept-Encoding", "identity")
 
-	resp, err := http.DefaultClient.Do(proxyReq)
+	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
 		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusBadGateway, "upstream request failed")
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
@@ -144,8 +214,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 	}
-	logLine, _ := json.Marshal(entry)
-	log.Println(string(logLine))
+	logRequest(entry)
 
 	rec := requestRecord{
 		ProjectKey:       projectKey,
@@ -159,7 +228,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		EstimatedCostUSD: estimatedCost(reqParsed.Model, inputTokens, outputTokens),
 	}
 	if err := saveRequest(r.Context(), pool, rec); err != nil {
-		log.Println("failed to save request record:", err)
+		slog.Error("failed to save request record", "err", err)
 	}
 }
 
@@ -177,7 +246,7 @@ func saveFailure(r *http.Request, projectKey, provider string, start time.Time, 
 		Error:      &errMsg,
 	}
 	if err := saveRequest(r.Context(), pool, rec); err != nil {
-		log.Println("failed to save request record:", err)
+		slog.Error("failed to save request record", "err", err)
 	}
 }
 
@@ -238,8 +307,7 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 	if !firstTokenAt.IsZero() {
 		entry.FirstTokenMs = firstTokenAt.Sub(start).Milliseconds()
 	}
-	logLine, _ := json.Marshal(entry)
-	log.Println(string(logLine))
+	logRequest(entry)
 
 	rec := requestRecord{
 		ProjectKey:       projectKey,
@@ -256,7 +324,7 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 		rec.FirstTokenMs = &entry.FirstTokenMs
 	}
 	if err := saveRequest(r.Context(), pool, rec); err != nil {
-		log.Println("failed to save request record:", err)
+		slog.Error("failed to save request record", "err", err)
 	}
 }
 
@@ -274,26 +342,69 @@ func requireEnv(names ...string) {
 		}
 	}
 	if len(missing) > 0 {
-		log.Fatalf("missing required environment variable(s): %s — set them in the environment or in a .env file", strings.Join(missing, ", "))
+		slog.Error("missing required environment variable(s) — set them in the environment or in a .env file", "missing", strings.Join(missing, ", "))
+		os.Exit(1)
 	}
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	// A missing .env is fine in production, where the platform sets
 	// variables directly; requireEnv below is what actually enforces them.
 	if err := godotenv.Load(); err != nil {
-		log.Println("no .env file found; relying on the process environment")
+		slog.Info("no .env file found; relying on the process environment")
 	}
 	requireEnv("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+
+	// Optional override of the request body size cap.
+	if v := os.Getenv("MAX_REQUEST_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			slog.Error("invalid MAX_REQUEST_BYTES; must be a positive integer", "value", v)
+			os.Exit(1)
+		}
+		maxRequestBytes = n
+	}
 
 	var err error
 	pool, err = connectDB(context.Background())
 	if err != nil {
-		log.Fatal("failed to connect to database: ", err)
+		slog.Error("failed to connect to database", "err", err)
+		os.Exit(1)
 	}
 	defer pool.Close()
 
-	http.HandleFunc("/", handler)
-	log.Println("proxy listening on :8080, forwarding /anthropic and /openai")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handler)
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // bound slow-header (slowloris) clients
+	}
+
+	// Run the server in the background so main can wait for a shutdown signal.
+	// A clean ListenAndServe returns http.ErrServerClosed after Shutdown; any
+	// other error means the listener itself failed and is fatal.
+	go func() {
+		slog.Info("proxy listening on :8080, forwarding /anthropic and /openai")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Fly (and most platforms) send SIGTERM on deploy/stop. Shutdown stops
+	// accepting new connections and waits up to the grace period for in-flight
+	// requests — including long-lived streams — to finish before we exit.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+
+	slog.Info("shutdown signal received; draining in-flight requests")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "err", err)
+	}
 }
