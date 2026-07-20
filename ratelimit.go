@@ -19,26 +19,24 @@ import (
 // usage limit, and they're set generously so normal bursty traffic sails
 // through.
 const (
-	burstSize       = 30 // max requests a project can fire back-to-back
-	refillPerSecond = 10 // sustained requests/second once the burst is spent
+	burstSize       = 30
+	refillPerSecond = 10
 )
 
-// monthlyLimit is the durable per-project cap enforced against the Postgres
-// month count (see projectStatus in db.go). Set MONTHLY_REQUEST_LIMIT to
-// change it, or to 0 to disable the cap entirely; main sets it at startup.
+// Set via MONTHLY_REQUEST_LIMIT (0 disables it); main sets this at startup.
+// See projectStatus in db.go for how it's enforced.
 var monthlyLimit int = 10000
 
-// bucket is one project's token balance. tokens is fractional so a partial
-// refill between requests isn't rounded away.
+// tokens is fractional so a partial refill between requests isn't rounded
+// away.
 type bucket struct {
 	tokens float64
 	last   time.Time
 }
 
-// limiter holds one bucket per project key. The map only ever gets entries for
-// keys that already passed validation (allow is called after projectStatus),
-// so it's bounded by the number of real projects. No reaper needed, and a
-// flood of garbage keys can't grow it.
+// Only ever gets entries for keys that already passed validation (allow is
+// called after projectStatus), so it's bounded by the number of real
+// projects. No reaper needed, and a flood of garbage keys can't grow it.
 type limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket

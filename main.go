@@ -23,20 +23,19 @@ import (
 
 var pool *pgxpool.Pool
 
-// rl is the in-memory per-project burst limiter (see ratelimit.go). The
-// authoritative monthly cap is enforced separately against Postgres.
+// The authoritative monthly cap is enforced separately, in Postgres (see
+// ratelimit.go).
 var rl = newLimiter(refillPerSecond, burstSize)
 
-// maxRequestBytes caps the request body we'll read and forward. LLM requests
-// can be large (long context, base64 images), so the default is generous;
-// override with MAX_REQUEST_BYTES. Set in main from the environment.
+// LLM requests can be large (long context, base64 images), so this default
+// is generous. Override with MAX_REQUEST_BYTES.
 var maxRequestBytes int64 = 25 << 20 // 25 MiB
 
-// httpClient forwards requests upstream. The timeouts are on the Transport, not
-// the Client: Client.Timeout would cap the whole request including reading the
-// body, which for a long-lived SSE stream would truncate it mid-response.
-// ResponseHeaderTimeout instead bounds only how long we wait for the upstream
-// to START responding, leaving streaming bodies free to run as long as needed.
+// The timeouts are on the Transport, not the Client: Client.Timeout would
+// cap the whole request including reading the body, which for a long-lived
+// SSE stream would truncate it mid-response. ResponseHeaderTimeout instead
+// bounds only how long we wait for the upstream to START responding, leaving
+// streaming bodies free to run as long as needed.
 var httpClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -84,9 +83,8 @@ type logEntry struct {
 	FirstTokenMs int64  `json:"first_token_ms,omitempty"`
 }
 
-// logRequest emits one request's metadata as a structured log line. It's the
-// only place per-request info gets logged, and it only ever takes metadata,
-// never bodies.
+// The only place per-request info gets logged; only ever metadata, never
+// bodies.
 func logRequest(e logEntry) {
 	slog.Info("request",
 		"method", e.Method,
@@ -113,10 +111,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// One round-trip validates the key and fetches this month's request count
-	// for the free-tier cap. Rejected requests below are not saved: an unknown
-	// key can't be attributed to a project, and a request we refuse never
-	// reaches the upstream, so there's no metadata to record.
+	// One round-trip covers both checks below. Rejected requests here aren't
+	// saved: an unknown key can't be attributed to a project, and a refused
+	// request never reaches upstream, so there's no metadata to record.
 	exists, monthCount, err := projectStatus(r.Context(), pool, projectKey)
 	if err != nil {
 		slog.Error("failed to validate project key", "err", err)
@@ -128,22 +125,19 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Durable monthly cap (survives restarts), disabled when set to 0. Bounded
-	// overshoot under high concurrency is acceptable for a soft quota and
-	// further limited by the burst check below.
+	// Bounded overshoot under high concurrency is acceptable for a soft quota,
+	// and the burst check below limits it further.
 	if monthlyLimit > 0 && monthCount >= monthlyLimit {
 		http.Error(w, "monthly request limit reached", http.StatusTooManyRequests)
 		return
 	}
 
-	// In-memory burst guardrail against a single project hammering us.
 	if !rl.allow(projectKey) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "too many requests, slow down", http.StatusTooManyRequests)
 		return
 	}
 
-	// Cap how much we'll read so an oversized body can't exhaust memory.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	reqBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -232,8 +226,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// saveFailure records a proxy-level failure (bad request body, unreachable
-// upstream, etc.) that never reaches the success path above.
 func saveFailure(r *http.Request, projectKey, provider string, start time.Time, model string, status int, errMsg string) {
 	rec := requestRecord{
 		ProjectKey: projectKey,
@@ -269,12 +261,11 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			w.Write(line) // passthrough first, unmodified
+			w.Write(line)
 			if flusher != nil {
 				flusher.Flush()
 			}
 
-			// Parse a local copy only; never touches the bytes already sent.
 			text := strings.TrimSpace(string(line))
 			switch provider {
 			case "anthropic":
@@ -323,13 +314,9 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 	}
 }
 
-// requireEnv fails startup if any of the given environment variables are
-// unset, so a misconfigured deployment is caught immediately instead of
-// surfacing later as a confusing failure.
-//
-// Note that no provider API key is required, or read anywhere in this
-// program. Each client request carries its own provider auth header, which is
-// forwarded upstream unchanged; the proxy never holds a key of its own.
+// No provider API key is required, or read anywhere in this program. Each
+// client request carries its own provider auth header, forwarded upstream
+// unchanged; the proxy never holds a key of its own.
 func requireEnv(names ...string) {
 	var missing []string
 	for _, name := range names {
@@ -388,7 +375,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second, // bound slow-header (slowloris) clients
 	}
 
-	// Run the server in the background so main can wait for a shutdown signal.
 	// A clean ListenAndServe returns http.ErrServerClosed after Shutdown; any
 	// other error means the listener itself failed and is fatal.
 	go func() {
