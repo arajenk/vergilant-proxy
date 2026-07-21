@@ -27,6 +27,10 @@ var pool *pgxpool.Pool
 // ratelimit.go).
 var rl = newLimiter(refillPerSecond, burstSize)
 
+// Positive key validations, cached briefly so repeat traffic skips the
+// cross-region DB check on the hot path. See keycache.go for the tradeoffs.
+var keys = newKeyCache()
+
 // LLM requests can be large (long context, base64 images), so this default
 // is generous. Override with MAX_REQUEST_BYTES.
 var maxRequestBytes int64 = 25 << 20 // 25 MiB
@@ -43,7 +47,14 @@ var httpClient = &http.Client{
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
 		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		// Default per-host is 2. With only two warm connections to a provider,
+		// concurrent traffic keeps opening fresh ones, paying a TCP+TLS
+		// handshake RTT each time; keeping more idle keeps them hot.
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		// Setting DialContext above otherwise disables HTTP/2; re-enable it so
+		// concurrent requests can multiplex over one provider connection.
+		ForceAttemptHTTP2: true,
 	},
 }
 
@@ -77,6 +88,9 @@ type logEntry struct {
 	Model        string `json:"model,omitempty"`
 	Status       int    `json:"status"`
 	LatencyMs    int64  `json:"latency_ms"`
+	ValidateMs   int64  `json:"validate_ms"`
+	UpstreamMs   int64  `json:"upstream_ms"`
+	Cached       bool   `json:"cached"`
 	InputTokens  int    `json:"input_tokens,omitempty"`
 	OutputTokens int    `json:"output_tokens,omitempty"`
 	Streamed     bool   `json:"streamed,omitempty"`
@@ -92,6 +106,9 @@ func logRequest(e logEntry) {
 		"model", e.Model,
 		"status", e.Status,
 		"latency_ms", e.LatencyMs,
+		"validate_ms", e.ValidateMs,
+		"upstream_ms", e.UpstreamMs,
+		"cached", e.Cached,
 		"input_tokens", e.InputTokens,
 		"output_tokens", e.OutputTokens,
 		"streamed", e.Streamed,
@@ -111,22 +128,32 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// One round-trip covers both checks below. Rejected requests here aren't
-	// saved: an unknown key can't be attributed to a project, and a refused
-	// request never reaches upstream, so there's no metadata to record.
-	exists, monthCount, err := projectStatus(r.Context(), pool, projectKey)
-	if err != nil {
-		slog.Error("failed to validate project key", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	// A brief positive cache keeps this cross-region DB round-trip off the hot
+	// path for repeat traffic. A miss falls through to the DB, so a new key
+	// works immediately; only positive results are cached (see keycache.go).
+	// Rejected requests aren't saved: an unknown key can't be attributed to a
+	// project, and a refused request never reaches upstream.
+	validateStart := time.Now()
+	monthCount, cached := keys.get(projectKey)
+	if !cached {
+		exists, cnt, err := projectStatus(r.Context(), pool, projectKey)
+		if err != nil {
+			slog.Error("failed to validate project key", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if !exists {
+			http.Error(w, "unknown project key", http.StatusUnauthorized)
+			return
+		}
+		keys.put(projectKey, cnt)
+		monthCount = cnt
 	}
-	if !exists {
-		http.Error(w, "unknown project key", http.StatusUnauthorized)
-		return
-	}
+	validateMs := time.Since(validateStart).Milliseconds()
 
 	// Bounded overshoot under high concurrency is acceptable for a soft quota,
-	// and the burst check below limits it further.
+	// and the burst check below limits it further. A cached count can also be
+	// up to keyCacheTTL stale, widening that overshoot within the tolerance.
 	if monthlyLimit > 0 && monthCount >= monthlyLimit {
 		http.Error(w, "monthly request limit reached", http.StatusTooManyRequests)
 		return
@@ -168,6 +195,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// resp.Body as raw gzip bytes.
 	proxyReq.Header.Set("Accept-Encoding", "identity")
 
+	upstreamStart := time.Now()
 	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
 		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusBadGateway, "upstream request failed")
@@ -175,9 +203,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	upstreamMs := time.Since(upstreamStart).Milliseconds()
 
 	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
-		streamResponse(w, r, resp, start, reqParsed, projectKey, provider)
+		streamResponse(w, r, resp, start, reqParsed, projectKey, provider, validateMs, upstreamMs, cached)
 		return
 	}
 
@@ -197,6 +226,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBytes)
+	// Push the response to the client now, so the metadata DB write below is
+	// off the client's critical path. Without this, net/http buffers a small
+	// body until the handler returns, which is after saveRequest completes.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 
 	entry := logEntry{
 		Timestamp:    start.UTC().Format(time.RFC3339),
@@ -205,6 +240,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		Model:        reqParsed.Model,
 		Status:       resp.StatusCode,
 		LatencyMs:    time.Since(start).Milliseconds(),
+		ValidateMs:   validateMs,
+		UpstreamMs:   upstreamMs,
+		Cached:       cached,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 	}
@@ -246,7 +284,7 @@ func saveFailure(r *http.Request, projectKey, provider string, start time.Time, 
 // of after the whole response lands. Alongside the passthrough it watches the
 // same bytes to recover token counts and first-token latency, since that info
 // is spread across multiple events instead of sitting in one JSON object.
-func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, reqParsed requestBody, projectKey, provider string) {
+func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, reqParsed requestBody, projectKey, provider string, validateMs, upstreamMs int64, cached bool) {
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
@@ -286,6 +324,9 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 		Model:        reqParsed.Model,
 		Status:       resp.StatusCode,
 		LatencyMs:    time.Since(start).Milliseconds(),
+		ValidateMs:   validateMs,
+		UpstreamMs:   upstreamMs,
+		Cached:       cached,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		Streamed:     true,
