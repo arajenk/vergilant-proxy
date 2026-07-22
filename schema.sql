@@ -30,9 +30,13 @@ CREATE INDEX idx_requests_project_time ON requests (project_key, timestamp);
 -- it as the X-Monitor-Key header. Insert a row here to mint one:
 --
 --   INSERT INTO projects (key, name) VALUES ('your-key-here', 'my app');
+-- monthly_request_limit overrides MONTHLY_REQUEST_LIMIT for one project. NULL,
+-- the default, means "use the env value"; 0 means "no cap for this project".
+-- Set it by hand if one project should get a different ceiling than the rest.
 CREATE TABLE projects (
-    id         BIGSERIAL PRIMARY KEY,
-    key        TEXT NOT NULL UNIQUE,
-    name       TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                    BIGSERIAL PRIMARY KEY,
+    key                   TEXT NOT NULL UNIQUE,
+    name                  TEXT NOT NULL,
+    monthly_request_limit INT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );

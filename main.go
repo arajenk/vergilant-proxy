@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
@@ -134,19 +135,28 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// Rejected requests aren't saved: an unknown key can't be attributed to a
 	// project, and a refused request never reaches upstream.
 	validateStart := time.Now()
-	monthCount, cached := keys.get(projectKey)
+	monthCount, limit, cached := keys.get(projectKey)
 	if !cached {
-		exists, cnt, err := projectStatus(r.Context(), pool, projectKey)
+		projectLimit, cnt, err := projectStatus(r.Context(), pool, projectKey)
+		// No row means no such project. This has to be checked before the
+		// generic error below, or an unknown key would 500 instead of 401.
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "unknown project key", http.StatusUnauthorized)
+			return
+		}
 		if err != nil {
 			slog.Error("failed to validate project key", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if !exists {
-			http.Error(w, "unknown project key", http.StatusUnauthorized)
-			return
+		// A NULL column means this project has no override and gets the
+		// configured default. Resolved once, here, so the cache and the check
+		// below both deal in a plain number.
+		limit = monthlyLimit
+		if projectLimit != nil {
+			limit = *projectLimit
 		}
-		keys.put(projectKey, cnt)
+		keys.put(projectKey, cnt, limit)
 		monthCount = cnt
 	}
 	validateMs := time.Since(validateStart).Milliseconds()
@@ -154,7 +164,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// Bounded overshoot under high concurrency is acceptable for a soft quota,
 	// and the burst check below limits it further. A cached count can also be
 	// up to keyCacheTTL stale, widening that overshoot within the tolerance.
-	if monthlyLimit > 0 && monthCount >= monthlyLimit {
+	if limit > 0 && monthCount >= limit {
 		http.Error(w, "monthly request limit reached", http.StatusTooManyRequests)
 		return
 	}
@@ -407,6 +417,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// Same spirit as requireEnv above: fail at startup with one clear message
+	// rather than turning every proxied request into a 500 because the
+	// database predates a column this build expects.
+	if err := checkSchema(context.Background(), pool); err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handler)

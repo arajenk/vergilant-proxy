@@ -24,7 +24,10 @@ const (
 )
 
 // Set via MONTHLY_REQUEST_LIMIT (0 disables it); main sets this at startup.
-// See projectStatus in db.go for how it's enforced.
+// It's the default for projects that don't set their own: a project's
+// monthly_request_limit column overrides this when it's non-NULL. The handler
+// picks between the two and does the enforcing; projectStatus in db.go just
+// reports the column and the count.
 var monthlyLimit int = 10000
 
 // tokens is fractional so a partial refill between requests isn't rounded

@@ -76,15 +76,22 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 // counter, so there's nothing to keep in sync. The (project_key, timestamp)
 // index in schema.sql keeps this a cheap range count. now() is UTC in
 // Postgres, so date_trunc gives a UTC month boundary.
-func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (exists bool, monthCount int, err error) {
+//
+// An unknown key returns pgx.ErrNoRows — selecting FROM projects rather than
+// asking EXISTS is what keeps the per-project limit on the same round-trip.
+// limit is nil when the column is NULL, meaning "use monthlyLimit"; the caller
+// resolves that, so this file doesn't reach into ratelimit.go's config.
+func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (limit *int, monthCount int, err error) {
 	err = pool.QueryRow(ctx, `
 		SELECT
-			EXISTS(SELECT 1 FROM projects WHERE key = $1),
+			p.monthly_request_limit,
 			(SELECT count(*) FROM requests
-			   WHERE project_key = $1 AND timestamp >= date_trunc('month', now()))`,
+			   WHERE project_key = p.key AND timestamp >= date_trunc('month', now()))
+		FROM projects p
+		WHERE p.key = $1`,
 		key,
-	).Scan(&exists, &monthCount)
-	return exists, monthCount, err
+	).Scan(&limit, &monthCount)
+	return limit, monthCount, err
 }
 
 func saveRequest(ctx context.Context, pool *pgxpool.Pool, rec requestRecord) error {

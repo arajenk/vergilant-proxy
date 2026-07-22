@@ -93,6 +93,35 @@ you'll see a row show up in `requests`.
 Drop a `.env` file in the working directory and it'll get picked up
 automatically.
 
+`MONTHLY_REQUEST_LIMIT` sets the cap for every project at once. To give one
+project a different ceiling, set its `monthly_request_limit` column, which
+overrides the env value for that project only:
+
+```sh
+# this one project gets 100k; everything else stays on the env default
+psql vergilant -c "UPDATE projects SET monthly_request_limit = 100000 WHERE key = 'busy-app'"
+
+# and 0 means no monthly cap at all, for that project
+psql vergilant -c "UPDATE projects SET monthly_request_limit = 0 WHERE key = 'busy-app'"
+```
+
+`NULL`, the default, means "use the env value". Changes take up to 45 seconds
+to take effect — see the key cache note in `keycache.go`.
+
+### If you upgrade and forget to re-apply the schema
+
+On startup the proxy checks that every column it reads or writes actually
+exists, and refuses to run if any are missing:
+
+```
+ERROR refusing to start
+      database is missing projects.monthly_request_limit; apply schema.sql
+```
+
+That's one message at boot instead of a 500 on every request. The list it
+checks is `requiredColumns` in `schema_check.go` — short, and worth a glance if
+you've customized the schema.
+
 There's also an in-memory per-project rate limiter (30 burst, 10/sec
 sustained) as a basic abuse guardrail. It lives in `ratelimit.go` as plain
 constants, so just edit them if your traffic looks different.
