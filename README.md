@@ -115,12 +115,18 @@ exists, and refuses to run if any are missing:
 
 ```
 ERROR refusing to start
-      database is missing projects.monthly_request_limit; apply schema.sql
+      database is missing projects.monthly_request_limit; apply the proxy's schema.sql
 ```
 
 That's one message at boot instead of a 500 on every request. The list it
 checks is `requiredColumns` in `schema_check.go` — short, and worth a glance if
 you've customized the schema.
+
+The `schema.sql` in this repo is the proxy's own, covering only the two tables
+it touches, and you apply it yourself. The hosted Vergilant service runs these
+same tables under an ordered migration runner; this check and that runner are
+separate mechanisms, so if you are running the full service, a missing column
+means a migration hasn't run — applying this file over it is the wrong fix.
 
 There's also an in-memory per-project rate limiter (30 burst, 10/sec
 sustained) as a basic abuse guardrail. It lives in `ratelimit.go` as plain

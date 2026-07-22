@@ -13,9 +13,15 @@ import (
 // so a database that predates a schema change fails immediately, with the
 // missing column named, instead of turning every proxied request into a 500.
 //
-// If you add a column to schema.sql and start using it, add it here too. The
-// list is short on purpose: it's what the two queries in db.go touch, not
-// every column in the file.
+// This module is standalone and ships its own schema.sql covering just the two
+// tables it touches, applied by hand. That file is what this check refers to.
+// The full Vergilant service keeps the same tables under an ordered migration
+// runner instead; if you are looking at that repo, the fix is to run the
+// migrations, not to apply this file over them.
+//
+// If you add a column to the proxy's schema.sql and start using it, add it here
+// too. The list is short on purpose: it's what the two queries in db.go touch,
+// not every column in the file.
 var requiredColumns = map[string][]string{
 	"projects": {"key", "monthly_request_limit"},
 	"requests": {
@@ -61,7 +67,7 @@ func checkSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if len(missing) > 0 {
 		// Sorted so the message is stable across runs; Go randomizes map order.
 		slices.Sort(missing)
-		return fmt.Errorf("database is missing %s; apply schema.sql",
+		return fmt.Errorf("database is missing %s; apply the proxy's schema.sql",
 			strings.Join(missing, ", "))
 	}
 	return nil
