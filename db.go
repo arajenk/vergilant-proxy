@@ -44,12 +44,18 @@ func estimatedCost(model string, inputTokens, outputTokens int) float64 {
 }
 
 type requestRecord struct {
-	ProjectKey       string
-	Timestamp        time.Time
-	Provider         string
-	Model            string
-	Status           int
-	LatencyMs        int64
+	ProjectKey string
+	Timestamp  time.Time
+	Provider   string
+	Model      string
+	Status     int
+	LatencyMs  int64
+	// The split of LatencyMs: our own key lookup, and the provider's time.
+	// Pointers because a request that failed before it reached either stage
+	// has no honest number to report, and a zero would read as "we added
+	// nothing" rather than "not measured".
+	ValidateMs       *int64
+	UpstreamMs       *int64
 	FirstTokenMs     *int64
 	InputTokens      int
 	OutputTokens     int
@@ -77,29 +83,38 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 // index in schema.sql keeps this a cheap range count. now() is UTC in
 // Postgres, so date_trunc gives a UTC month boundary.
 //
-// An unknown key returns pgx.ErrNoRows — selecting FROM projects rather than
+// An unknown key returns pgx.ErrNoRows - selecting FROM projects rather than
 // asking EXISTS is what keeps the per-project limit on the same round-trip.
 // limit is nil when the column is NULL, meaning "use monthlyLimit"; the caller
 // resolves that, so this file doesn't reach into ratelimit.go's config.
-func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (limit *int, monthCount int, err error) {
+// capMonths is how many consecutive whole months the owning account has
+// finished over its cap. The quota ladder uses it to decide whether this
+// project still gets its grace window - see the quota package.
+//
+// LEFT JOIN and COALESCE because projects.user_id is nullable: a project with
+// no owner has no history, which is the same as a clean one.
+func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (limit *int, monthCount, capMonths int, err error) {
 	err = pool.QueryRow(ctx, `
 		SELECT
 			p.monthly_request_limit,
 			(SELECT count(*) FROM requests
-			   WHERE project_key = p.key AND timestamp >= date_trunc('month', now()))
+			   WHERE project_key = p.key AND timestamp >= date_trunc('month', now())),
+			COALESCE(u.consecutive_cap_months, 0)
 		FROM projects p
+		LEFT JOIN users u ON u.id = p.user_id
 		WHERE p.key = $1`,
 		key,
-	).Scan(&limit, &monthCount)
-	return limit, monthCount, err
+	).Scan(&limit, &monthCount, &capMonths)
+	return limit, monthCount, capMonths, err
 }
 
 func saveRequest(ctx context.Context, pool *pgxpool.Pool, rec requestRecord) error {
 	_, err := pool.Exec(ctx, `
 		INSERT INTO requests
-			(project_key, timestamp, provider, model, status, latency_ms, first_token_ms, input_tokens, output_tokens, estimated_cost_usd, error)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			(project_key, timestamp, provider, model, status, latency_ms, validate_ms, upstream_ms, first_token_ms, input_tokens, output_tokens, estimated_cost_usd, error)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		rec.ProjectKey, rec.Timestamp, rec.Provider, rec.Model, rec.Status, rec.LatencyMs,
+		rec.ValidateMs, rec.UpstreamMs,
 		rec.FirstTokenMs, rec.InputTokens, rec.OutputTokens, rec.EstimatedCostUSD, rec.Error,
 	)
 	return err

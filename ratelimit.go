@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/arajenk/vergilant-proxy/quota"
+
 	"sync"
 	"time"
 )
@@ -28,7 +30,7 @@ const (
 // monthly_request_limit column overrides this when it's non-NULL. The handler
 // picks between the two and does the enforcing; projectStatus in db.go just
 // reports the column and the count.
-var monthlyLimit int = 10000
+var monthlyLimit int = quota.DefaultFreeMonthlyLimit
 
 // tokens is fractional so a partial refill between requests isn't rounded
 // away.

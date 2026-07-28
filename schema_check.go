@@ -23,11 +23,15 @@ import (
 // too. The list is short on purpose: it's what the two queries in db.go touch,
 // not every column in the file.
 var requiredColumns = map[string][]string{
-	"projects": {"key", "monthly_request_limit"},
+	"projects": {"key", "monthly_request_limit", "user_id"},
+	// Read by projectStatus for the quota ladder: without it the proxy cannot
+	// tell a first offence from a repeat one, and would hand back the grace
+	// window every month.
+	"users": {"id", "consecutive_cap_months"},
 	"requests": {
 		"project_key", "timestamp", "provider", "model", "status",
-		"latency_ms", "first_token_ms", "input_tokens", "output_tokens",
-		"estimated_cost_usd", "error",
+		"latency_ms", "validate_ms", "upstream_ms", "first_token_ms",
+		"input_tokens", "output_tokens", "estimated_cost_usd", "error",
 	},
 }
 
@@ -38,7 +42,7 @@ func checkSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		SELECT table_name, column_name
 		FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = ANY($1)`,
-		[]string{"projects", "requests"})
+		[]string{"projects", "requests", "users"})
 	if err != nil {
 		return fmt.Errorf("could not read the database's own column list: %w", err)
 	}

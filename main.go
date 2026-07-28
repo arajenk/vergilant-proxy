@@ -19,6 +19,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/arajenk/vergilant-proxy/quota"
 	"github.com/joho/godotenv"
 )
 
@@ -117,6 +119,21 @@ func logRequest(e logEntry) {
 	)
 }
 
+// The quota ladder lives in the quota package, so the proxy, the alerts daemon
+// and the api all read one definition instead of three copies kept in step by
+// hand. It is in this module because this is where it is enforced, and because
+// this module is the public mirror - the limits should be readable by anyone
+// looking at the core.
+
+func recordRequest(ctx context.Context, rec requestRecord, record bool) {
+	if !record {
+		return
+	}
+	if err := saveRequest(ctx, pool, rec); err != nil {
+		slog.Error("failed to save request record", "err", err)
+	}
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	projectKey := r.Header.Get("X-Monitor-Key")
@@ -135,9 +152,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// Rejected requests aren't saved: an unknown key can't be attributed to a
 	// project, and a refused request never reaches upstream.
 	validateStart := time.Now()
-	monthCount, limit, cached := keys.get(projectKey)
+	monthCount, limit, capMonths, cached := keys.get(projectKey)
 	if !cached {
-		projectLimit, cnt, err := projectStatus(r.Context(), pool, projectKey)
+		projectLimit, cnt, months, err := projectStatus(r.Context(), pool, projectKey)
 		// No row means no such project. This has to be checked before the
 		// generic error below, or an unknown key would 500 instead of 401.
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -145,27 +162,50 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			slog.Error("failed to validate project key", "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
+			// The database is unreachable - it is not answering "no such key",
+			// which was handled above. Rather than fail a request for a key we
+			// have already validated before, serve the last known-good answer.
+			//
+			// The metadata for this request is lost either way: if the database
+			// cannot be read it cannot be written either, so saveRequest is
+			// going to fail too. The only thing in question is whether we also
+			// break the caller's production traffic on the way out, and a
+			// monitoring tool should not be able to do that. Note this is not
+			// blanket fail-open: an unknown key has no cache entry, so it still
+			// gets the 500 below rather than being forwarded.
+			staleCount, staleLimit, staleMonths, stale := keys.getStale(projectKey)
+			if !stale {
+				slog.Error("failed to validate project key", "err", err)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			// Warn, not Error: the request is being served. This is the line
+			// that says quota enforcement is running blind right now.
+			slog.Warn("database unreachable, serving stale key status",
+				"err", err, "max_stale", keyCacheMaxStale)
+			monthCount, limit, capMonths = staleCount, staleLimit, staleMonths
+			// Deliberately no keys.put: re-caching would reset the expiry and
+			// let a long outage renew itself past keyCacheMaxStale forever.
+		} else {
+			// A NULL column means this project has no override and gets the
+			// configured default. Resolved once, here, so the cache and the
+			// check below both deal in a plain number.
+			limit = monthlyLimit
+			if projectLimit != nil {
+				limit = *projectLimit
+			}
+			keys.put(projectKey, cnt, limit, months)
+			monthCount, capMonths = cnt, months
 		}
-		// A NULL column means this project has no override and gets the
-		// configured default. Resolved once, here, so the cache and the check
-		// below both deal in a plain number.
-		limit = monthlyLimit
-		if projectLimit != nil {
-			limit = *projectLimit
-		}
-		keys.put(projectKey, cnt, limit)
-		monthCount = cnt
 	}
 	validateMs := time.Since(validateStart).Milliseconds()
 
 	// Bounded overshoot under high concurrency is acceptable for a soft quota,
 	// and the burst check below limits it further. A cached count can also be
 	// up to keyCacheTTL stale, widening that overshoot within the tolerance.
-	if limit > 0 && monthCount >= limit {
-		http.Error(w, "monthly request limit reached", http.StatusTooManyRequests)
+	q := quota.For(limit, monthCount, capMonths)
+	if q.Refuse {
+		http.Error(w, "monthly request limit exceeded by too much; contact support", http.StatusTooManyRequests)
 		return
 	}
 
@@ -183,7 +223,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		saveFailure(r, projectKey, provider, start, "", http.StatusBadRequest, "failed to read request body")
+		saveFailure(r, projectKey, provider, start, "", http.StatusBadRequest, "failed to read request body", q.Record)
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -194,11 +234,16 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	proxyReq, err := http.NewRequest(r.Method, providers[provider]+forwardPath, bytes.NewReader(reqBytes))
 	if err != nil {
-		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusInternalServerError, "failed to build upstream request")
+		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusInternalServerError, "failed to build upstream request", q.Record)
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
 		return
 	}
 	proxyReq.Header = r.Header.Clone()
+	// Ours, not the provider's. Cloning the caller's headers is what forwards
+	// their API key untouched, which is the point - but this one identifies a
+	// Vergilant project and has no business in Anthropic's or OpenAI's request
+	// logs. They would ignore it; that is not a reason to send it.
+	proxyReq.Header.Del("X-Monitor-Key")
 	// Force plaintext so the streaming path can parse SSE text directly;
 	// otherwise http.DefaultClient only auto-decompresses gzip when it set
 	// Accept-Encoding itself, and a client-supplied value would leave
@@ -208,7 +253,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	upstreamStart := time.Now()
 	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
-		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusBadGateway, "upstream request failed")
+		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusBadGateway, "upstream request failed", q.Record)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
@@ -216,13 +261,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	upstreamMs := time.Since(upstreamStart).Milliseconds()
 
 	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
-		streamResponse(w, r, resp, start, reqParsed, projectKey, provider, validateMs, upstreamMs, cached)
+		streamResponse(w, r, resp, start, reqParsed, projectKey, provider, validateMs, upstreamMs, cached, q.Record)
 		return
 	}
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusBadGateway, "failed to read upstream response")
+		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusBadGateway, "failed to read upstream response", q.Record)
 		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
 		return
 	}
@@ -265,16 +310,16 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		Model:            reqParsed.Model,
 		Status:           resp.StatusCode,
 		LatencyMs:        entry.LatencyMs,
+		ValidateMs:       &validateMs,
+		UpstreamMs:       &upstreamMs,
 		InputTokens:      inputTokens,
 		OutputTokens:     outputTokens,
 		EstimatedCostUSD: estimatedCost(reqParsed.Model, inputTokens, outputTokens),
 	}
-	if err := saveRequest(r.Context(), pool, rec); err != nil {
-		slog.Error("failed to save request record", "err", err)
-	}
+	recordRequest(r.Context(), rec, q.Record)
 }
 
-func saveFailure(r *http.Request, projectKey, provider string, start time.Time, model string, status int, errMsg string) {
+func saveFailure(r *http.Request, projectKey, provider string, start time.Time, model string, status int, errMsg string, record bool) {
 	rec := requestRecord{
 		ProjectKey: projectKey,
 		Timestamp:  start.UTC(),
@@ -284,9 +329,7 @@ func saveFailure(r *http.Request, projectKey, provider string, start time.Time, 
 		LatencyMs:  time.Since(start).Milliseconds(),
 		Error:      &errMsg,
 	}
-	if err := saveRequest(r.Context(), pool, rec); err != nil {
-		slog.Error("failed to save request record", "err", err)
-	}
+	recordRequest(r.Context(), rec, record)
 }
 
 // streamResponse passes an SSE response through to the client one line at a
@@ -294,7 +337,7 @@ func saveFailure(r *http.Request, projectKey, provider string, start time.Time, 
 // of after the whole response lands. Alongside the passthrough it watches the
 // same bytes to recover token counts and first-token latency, since that info
 // is spread across multiple events instead of sitting in one JSON object.
-func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, reqParsed requestBody, projectKey, provider string, validateMs, upstreamMs int64, cached bool) {
+func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, reqParsed requestBody, projectKey, provider string, validateMs, upstreamMs int64, cached, record bool) {
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
@@ -353,6 +396,8 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 		Model:            reqParsed.Model,
 		Status:           resp.StatusCode,
 		LatencyMs:        entry.LatencyMs,
+		ValidateMs:       &validateMs,
+		UpstreamMs:       &upstreamMs,
 		InputTokens:      inputTokens,
 		OutputTokens:     outputTokens,
 		EstimatedCostUSD: estimatedCost(reqParsed.Model, inputTokens, outputTokens),
@@ -360,9 +405,7 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 	if entry.FirstTokenMs > 0 {
 		rec.FirstTokenMs = &entry.FirstTokenMs
 	}
-	if err := saveRequest(r.Context(), pool, rec); err != nil {
-		slog.Error("failed to save request record", "err", err)
-	}
+	recordRequest(r.Context(), rec, record)
 }
 
 // No provider API key is required, or read anywhere in this program. Each

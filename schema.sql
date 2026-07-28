@@ -1,5 +1,6 @@
--- Everything the proxy needs, and nothing else. Two tables: one holding the
--- keys it validates, one holding the metadata it records.
+-- Everything the proxy needs, and nothing else. Three tables: one holding the
+-- keys it validates, one holding the metadata it records, and a thin owners
+-- table the quota ladder reads.
 --
 -- Note what is absent: there is no column anywhere below for a request or
 -- response body, because the proxy never has one to store. Bodies pass through
@@ -14,6 +15,11 @@ CREATE TABLE requests (
     model              TEXT NOT NULL,
     status             INT NOT NULL,
     latency_ms         BIGINT NOT NULL,
+    -- The split of latency_ms: this proxy's own key lookup, and the provider's
+    -- time. Nullable because a request that failed before reaching either stage
+    -- has no honest number, and a zero would claim the proxy added nothing.
+    validate_ms        BIGINT,
+    upstream_ms        BIGINT,
     first_token_ms     BIGINT,
     input_tokens       INT NOT NULL,
     output_tokens      INT NOT NULL,
@@ -26,6 +32,21 @@ CREATE TABLE requests (
 -- gets slower as the table grows.
 CREATE INDEX idx_requests_project_time ON requests (project_key, timestamp);
 
+-- The owner of a project, and the only thing the proxy reads about one.
+--
+-- If you are running this proxy on its own you can leave projects.user_id NULL
+-- and never insert here. An unowned project has no history, which the ladder
+-- treats the same as a clean one, so it simply gets the full grace window.
+--
+-- consecutive_cap_months is how many whole months in a row this owner has
+-- finished over their cap. See the quota package: at 2 or more, a project stops
+-- being recorded at its limit instead of at twice the limit. Nothing in this
+-- module writes the column; it is set by whatever bills the account.
+CREATE TABLE users (
+    id                     BIGSERIAL PRIMARY KEY,
+    consecutive_cap_months INT NOT NULL DEFAULT 0
+);
+
 -- A project is a key the proxy checks before forwarding anything. Clients send
 -- it as the X-Monitor-Key header. Insert a row here to mint one:
 --
@@ -37,6 +58,7 @@ CREATE TABLE projects (
     id                    BIGSERIAL PRIMARY KEY,
     key                   TEXT NOT NULL UNIQUE,
     name                  TEXT NOT NULL,
+    user_id               BIGINT REFERENCES users(id),
     monthly_request_limit INT,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );

@@ -106,7 +106,35 @@ psql vergilant -c "UPDATE projects SET monthly_request_limit = 0 WHERE key = 'bu
 ```
 
 `NULL`, the default, means "use the env value". Changes take up to 45 seconds
-to take effect — see the key cache note in `keycache.go`.
+to take effect - see the key cache note in `keycache.go`.
+
+### What actually happens when a project goes over
+
+Going over the limit doesn't stop the request. The proxy keeps forwarding, and
+what it drops is the record:
+
+| Usage | Forwarded | Recorded |
+|---|---|---|
+| under the limit | yes | yes |
+| up to 2x | yes | yes |
+| 2x to 4x | yes | no |
+| 4x and over | no, 429 | no |
+
+This thing sits in your request path. Refusing a call the second someone
+crosses a billing threshold takes their app down to make a point, and an app
+that went down gets the tool pulled out rather than paid for. So the cap takes
+the monitoring away instead: past 2x nothing is written, the dashboard goes
+quiet and alerts stop firing, and the calls themselves carry on. The 429 at 4x
+is only there so a free tier can't be used as an unlimited relay forever.
+
+An account that has finished two months in a row over its limit loses the
+middle row, so recording stops at the limit itself. Forwarding is unchanged for
+them, right up to the same 4x ceiling. That count is
+`users.consecutive_cap_months`. Nothing in this module writes it, so set it
+from whatever handles your billing, or ignore the table entirely and leave
+`projects.user_id` NULL - a project with no owner gets the full grace window.
+
+The multipliers are plain constants in `quota/quota.go`.
 
 ### If you upgrade and forget to re-apply the schema
 
@@ -119,14 +147,14 @@ ERROR refusing to start
 ```
 
 That's one message at boot instead of a 500 on every request. The list it
-checks is `requiredColumns` in `schema_check.go` — short, and worth a glance if
+checks is `requiredColumns` in `schema_check.go` - short, and worth a glance if
 you've customized the schema.
 
-The `schema.sql` in this repo is the proxy's own, covering only the two tables
-it touches, and you apply it yourself. The hosted Vergilant service runs these
+The `schema.sql` in this repo is the proxy's own, covering only the three
+tables it touches, and you apply it yourself. The hosted Vergilant service runs these
 same tables under an ordered migration runner; this check and that runner are
 separate mechanisms, so if you are running the full service, a missing column
-means a migration hasn't run — applying this file over it is the wrong fix.
+means a migration hasn't run - applying this file over it is the wrong fix.
 
 There's also an in-memory per-project rate limiter (30 burst, 10/sec
 sustained) as a basic abuse guardrail. It lives in `ratelimit.go` as plain
