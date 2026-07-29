@@ -134,6 +134,17 @@ func recordRequest(ctx context.Context, rec requestRecord, record bool) {
 	}
 }
 
+// Search Console holds vergilant.dev as a domain property, which covers every
+// subdomain, so Googlebot reaches this host too. Nothing here is worth
+// indexing - every path either 404s or needs a customer's API key - and
+// without this the crawler is told nothing, which Google reads as "crawl
+// freely". The result is junk 404s in the site's Pages report and pointless
+// load on a service that exists to carry customer traffic.
+func robotsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	io.WriteString(w, "User-agent: *\nDisallow: /\n")
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	projectKey := r.Header.Get("X-Monitor-Key")
@@ -470,6 +481,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// Registered before "/" only for readability; ServeMux matches the most
+	// specific pattern regardless of order, so this wins over the catch-all.
+	mux.HandleFunc("/robots.txt", robotsHandler)
 	mux.HandleFunc("/", handler)
 	srv := &http.Server{
 		Addr:              ":8080",

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,15 +17,25 @@ type modelPrice struct {
 	OutputPerMillion float64
 }
 
-// Hardcoded, updated by hand. Sonnet 5 is at introductory pricing
-// ($2/$10 per million) through 2026-08-31; it reverts to $3/$15 after.
+// Hardcoded, updated by hand. A model missing from here costs $0, which is
+// worse than it sounds: see estimatedCost below.
 //
-// The OpenAI rows below are current as of this author's knowledge cutoff
-// (January 2026), not verified against OpenAI's live pricing page. Check
-// https://openai.com/api/pricing before relying on them for real billing.
+// The Claude rows were verified against
+// https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-28.
+// Sonnet 5 is at introductory pricing ($2/$10 per million) through
+// 2026-08-31; it reverts to $3/$15 on 2026-09-01, which is a diary entry, not
+// something this map notices on its own.
+//
+// The OpenAI rows below are NOT verified. openai.com/api/pricing refused
+// automated fetches on 2026-07-28 and the third-party trackers disagreed with
+// each other, so they are left as they were rather than updated from a source
+// that might be wrong. Check the live page by hand before trusting them.
 var priceMap = map[string]modelPrice{
+	"claude-fable-5":            {InputPerMillion: 10, OutputPerMillion: 50},
+	"claude-opus-5":             {InputPerMillion: 5, OutputPerMillion: 25},
 	"claude-opus-4-8":           {InputPerMillion: 5, OutputPerMillion: 25},
 	"claude-sonnet-5":           {InputPerMillion: 2, OutputPerMillion: 10},
+	"claude-haiku-4-5":          {InputPerMillion: 1, OutputPerMillion: 5},
 	"claude-haiku-4-5-20251001": {InputPerMillion: 1, OutputPerMillion: 5},
 
 	"gpt-4o":       {InputPerMillion: 2.5, OutputPerMillion: 10},
@@ -34,9 +46,37 @@ var priceMap = map[string]modelPrice{
 	"o3-mini":      {InputPerMillion: 1.1, OutputPerMillion: 4.4},
 }
 
+// Which unpriced models have already been warned about, so each one produces
+// a single log line instead of one per request.
+var (
+	unpricedMu   sync.Mutex
+	unpricedSeen = map[string]bool{}
+)
+
+// warnUnpricedOnce reports a model missing from priceMap, the first time that
+// model is seen. Only the model name is logged, which is metadata like every
+// other field the proxy records.
+func warnUnpricedOnce(model string) {
+	unpricedMu.Lock()
+	defer unpricedMu.Unlock()
+	if unpricedSeen[model] {
+		return
+	}
+	unpricedSeen[model] = true
+	slog.Warn("unpriced model: not in priceMap, so its cost is recorded as $0 "+
+		"and cost_spike cannot fire for any project using it; add it to priceMap in db.go",
+		"model", model)
+}
+
 func estimatedCost(model string, inputTokens, outputTokens int) float64 {
 	price, ok := priceMap[model]
 	if !ok {
+		// Zero rather than a guess: the map is hand-maintained and an invented
+		// price would corrupt every cost number downstream. But zero is not a
+		// harmless default either - cost_spike compares spend against a
+		// baseline, and 0 is never greater than 5x0 - so the miss gets said
+		// out loud instead of being absorbed.
+		warnUnpricedOnce(model)
 		return 0
 	}
 	return float64(inputTokens)/1_000_000*price.InputPerMillion +

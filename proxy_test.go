@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -275,6 +277,28 @@ func TestUnknownProviderIs404(t *testing.T) {
 	}
 }
 
+// No resetDB/seedProject: robots.txt is served before any key or database
+// lookup, so this passes with no Postgres at all - which is the point, since a
+// crawler never carries a key.
+func TestRobotsTxtDisallowsEverything(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", robotsHandler)
+	mux.HandleFunc("/", handler)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/robots.txt", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := rec.Body.String(); got != "User-agent: *\nDisallow: /\n" {
+		t.Errorf("body = %q, want a total disallow", got)
+	}
+}
+
 func TestProxiesUpstreamAndRecordsMetadata(t *testing.T) {
 	resetDB(t)
 	seedProject(t, "lm_ok")
@@ -423,6 +447,77 @@ func TestEstimatedCostUsesThePriceMap(t *testing.T) {
 	// hand-maintained (project-context.md), so this is the silent-$0 case.
 	if got := estimatedCost("some-model-nobody-priced", 1_000_000, 1_000_000); got != 0 {
 		t.Errorf("estimatedCost for an unknown model = %v, want 0", got)
+	}
+}
+
+// Returning $0 for an unpriced model is deliberate - the price map is
+// hand-maintained and inventing a number would be worse than reporting none.
+// What is not deliberate is that it happens silently. A $0 cost means
+// cost_spike's baseline_multiple mode compares 0 against 0, which is never
+// greater, so an unpriced model quietly disables the product's headline alert
+// for that project and looks identical to everything working. The miss has to
+// surface somewhere, and the log is the cheapest place.
+//
+// Once per model, not once per request: a busy project on an unpriced model
+// would otherwise write a log line per call, which is how a warning becomes
+// invisible.
+func TestUnpricedModelIsLoggedOnce(t *testing.T) {
+	var buf bytes.Buffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer slog.SetDefault(restore)
+
+	// Unique per run so the once-only latch cannot leak in from another test.
+	const model = "claude-opus-5-deliberately-absent-from-the-map"
+	estimatedCost(model, 1_000_000, 1_000_000)
+	estimatedCost(model, 500_000, 500_000)
+
+	if n := strings.Count(buf.String(), model); n != 1 {
+		t.Errorf("unpriced model named %d times in the log, want exactly 1:\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "unpriced") {
+		t.Errorf("log never says the model is unpriced, so the reason is lost:\n%s", buf.String())
+	}
+}
+
+// The map is hand-maintained, so the models most likely to arrive have to
+// actually be in it - a miss is a $0 cost and a cost_spike rule that cannot
+// fire. Prices verified by hand against
+// https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-28.
+// When this fails, check the live page rather than guessing the new number.
+func TestCurrentClaudeModelsArePriced(t *testing.T) {
+	for _, want := range []struct {
+		model         string
+		input, output float64
+	}{
+		{"claude-opus-5", 5, 25},
+		{"claude-fable-5", 10, 50},
+		{"claude-haiku-4-5", 1, 5},
+	} {
+		got, ok := priceMap[want.model]
+		if !ok {
+			t.Errorf("%s is missing from priceMap, so its cost records as $0", want.model)
+			continue
+		}
+		if got.InputPerMillion != want.input || got.OutputPerMillion != want.output {
+			t.Errorf("%s priced at $%v/$%v per million, want $%v/$%v",
+				want.model, got.InputPerMillion, got.OutputPerMillion, want.input, want.output)
+		}
+	}
+}
+
+// Guard against the naive fix: logging on every lookup rather than only on a
+// miss would drown the warning above in noise from ordinary traffic.
+func TestPricedModelLogsNothing(t *testing.T) {
+	var buf bytes.Buffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer slog.SetDefault(restore)
+
+	estimatedCost("claude-sonnet-5", 1_000_000, 1_000_000)
+
+	if buf.Len() != 0 {
+		t.Errorf("a priced model logged %q, want silence", buf.String())
 	}
 }
 
