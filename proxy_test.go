@@ -18,23 +18,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The proxy handles live customer traffic and had no tests at all. The gap that
-// prompted these: saveRequest's INSERT lists its columns and its values
-// separately, so the two can disagree - and when they do, nothing fails loudly.
-// The customer's call still succeeds, slog.Error goes to stdout, and the
-// dashboard simply stops filling up.
-//
-// These run against a real Postgres because that is the failure mode: a mock
-// would happily accept an INSERT the database would reject.
+// These run against a real Postgres, because a mock would accept an INSERT the
+// database rejects, and saveRequest's column list and value list can disagree
+// without anything failing loudly.
 //
 // Point TEST_DATABASE_URL at a database with schema.sql applied. Tests fail
-// rather than skip when none is reachable, because a silent skip is how
-// untested code ships. Set LLM_MONITOR_SKIP_DB_TESTS=1 to opt out on purpose.
-//
-// The schema is applied for this harness rather than by it: this module is its
-// own, so it cannot reach the migration runner the hosted service uses. In the
-// repo this is mirrored from that is a make target; standalone, it is
-// schema.sql.
+// rather than skip when none is reachable; LLM_MONITOR_SKIP_DB_TESTS=1 opts out.
+// The schema is applied for this harness, not by it: this module cannot reach
+// the migration runner the hosted service uses.
 
 const defaultTestDatabaseURL = "postgres://127.0.0.1:5544/llm_monitor_test"
 
@@ -55,9 +46,8 @@ func TestMain(m *testing.M) {
 	case err != nil:
 		testDBUnavailable = fmt.Sprintf("could not reach %s: %v", url, err)
 	default:
-		// The schema is applied for this harness, not by it. Probing the column
-		// the newest change added catches "database exists but is stale" as
-		// well as "never set up".
+		// Probing the newest column catches a stale database as well as a
+		// missing one.
 		var exists bool
 		if qerr := p.QueryRow(ctx, `
 			SELECT EXISTS (
@@ -85,8 +75,8 @@ func requireDB(t *testing.T) {
 		" (point TEST_DATABASE_URL at a database with the schema applied)")
 }
 
-// resetDB clears what these tests write and the caches that outlive a request,
-// so one test's warm key cache cannot make the next one pass.
+// Clears what these tests write, plus the caches that outlive a request, so one
+// test's warm key cache cannot make the next one pass.
 func resetDB(t *testing.T) {
 	t.Helper()
 	requireDB(t)
@@ -98,10 +88,8 @@ func resetDB(t *testing.T) {
 	rl = newLimiter(refillPerSecond, burstSize)
 }
 
-// seedProject makes a project with no owner, which is what schema.sql's default
-// shape looks like: projectStatus LEFT JOINs users, so an unowned project reads
-// a cap history of zero and gets the full grace window. Tests that need a
-// history call seedOwner instead.
+// A project with no owner, which reads a cap history of zero and gets the full
+// grace window. Tests needing a history call seedOwner.
 func seedProject(t *testing.T, key string) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
@@ -110,13 +98,10 @@ func seedProject(t *testing.T, key string) {
 	}
 }
 
-// seedOwner inserts an owner carrying a cap history and returns its id.
-//
-// Two inserts because this module can run against two different users tables.
-// Its own schema.sql gives users an id and the cap counter and nothing else,
-// since that is all the proxy reads. The hosted service's table has more, and
-// some of it is NOT NULL, so the minimal insert fails there and the fuller one
-// is the fallback rather than the default.
+// Inserts an owner carrying a cap history and returns its id. Two inserts
+// because this module runs against two different users tables: its own
+// schema.sql has only id and the cap counter, while the hosted service's table
+// has NOT NULL columns the minimal insert cannot satisfy.
 func seedOwner(t *testing.T, key string, capMonths int) int64 {
 	t.Helper()
 	ctx := context.Background()
@@ -135,8 +120,7 @@ func seedOwner(t *testing.T, key string, capMonths int) int64 {
 	return id
 }
 
-// stubUpstream points a provider at a local server for the duration of a test,
-// so nothing here calls a real API or spends money.
+// Points a provider at a local server for one test, so nothing calls a real API.
 func stubUpstream(t *testing.T, provider string, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(h)
@@ -164,9 +148,8 @@ func post(t *testing.T, path, key, body string) *httptest.ResponseRecorder {
 	return rec
 }
 
-// The motivating test. Every column the INSERT names has to actually receive
-// its value; a mismatch between the column list and the value list is the
-// failure this file exists to catch.
+// Every column the INSERT names has to receive its value. A mismatch between the
+// column list and the value list is the failure this file exists to catch.
 func TestSaveRequestPersistsEveryColumn(t *testing.T) {
 	resetDB(t)
 	seedProject(t, "lm_save")
@@ -227,8 +210,8 @@ func TestSaveRequestPersistsEveryColumn(t *testing.T) {
 	}
 }
 
-// A request that never reached either stage has no honest timing to report, so
-// the columns stay null rather than claiming the proxy added nothing.
+// A request that reached neither stage has no timing to report, so the columns
+// stay null rather than claiming the proxy added nothing.
 func TestFailuresBeforeUpstreamLeaveTimingsNull(t *testing.T) {
 	resetDB(t)
 	seedProject(t, "lm_fail")
@@ -255,8 +238,8 @@ func TestUnknownKeyIsRejectedAndNotRecorded(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
-	// An unknown key belongs to no project, so there is nothing to attribute a
-	// row to - and recording them would let a stranger fill someone's table.
+	// An unknown key belongs to no project, and recording it would let a stranger
+	// fill someone's table.
 	var count int
 	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM requests`).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -277,9 +260,8 @@ func TestUnknownProviderIs404(t *testing.T) {
 	}
 }
 
-// No resetDB/seedProject: robots.txt is served before any key or database
-// lookup, so this passes with no Postgres at all - which is the point, since a
-// crawler never carries a key.
+// No resetDB or seedProject: robots.txt is served before any key or database
+// lookup, since a crawler never carries a key.
 func TestRobotsTxtDisallowsEverything(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/robots.txt", robotsHandler)
@@ -322,8 +304,7 @@ func TestProxiesUpstreamAndRecordsMetadata(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
 	}
-	// The provider path is forwarded with the provider segment stripped, and
-	// the customer's own auth header rides along untouched.
+	// The provider segment is stripped, and the caller's auth header is untouched.
 	if gotPath != "/v1/messages" {
 		t.Errorf("forwarded path = %q, want /v1/messages", gotPath)
 	}
@@ -333,7 +314,7 @@ func TestProxiesUpstreamAndRecordsMetadata(t *testing.T) {
 	if gotMonitorKey != "" {
 		t.Errorf("X-Monitor-Key = %q, want it stripped rather than leaked upstream", gotMonitorKey)
 	}
-	// Passthrough means byte-identical: the caller gets what the provider sent.
+	// Byte-identical: the caller gets what the provider sent.
 	if body, _ := io.ReadAll(rec.Body); string(body) != anthropicReply {
 		t.Errorf("response body was rewritten:\n got %s\nwant %s", body, anthropicReply)
 	}
@@ -361,9 +342,8 @@ func TestProxiesUpstreamAndRecordsMetadata(t *testing.T) {
 	}
 }
 
-// CLAUDE.md: this service handles other people's API keys in transit and must
-// never store request or response content. That is structural - there is no
-// column for it - and this pins the structure rather than trusting it.
+// The service must never store request or response content. There is no column
+// for it; this pins that rather than trusting it.
 func TestNothingFromTheBodyIsEverStored(t *testing.T) {
 	resetDB(t)
 	seedProject(t, "lm_priv")
@@ -378,8 +358,7 @@ func TestNothingFromTheBodyIsEverStored(t *testing.T) {
 	post(t, "/anthropic/v1/messages", "lm_priv",
 		fmt.Sprintf(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":%q}]}`, secret))
 
-	// Every column of every row, as text. If the prompt or the reply is
-	// anywhere in this table, it shows up here.
+	// Every column of every row as text, so a leaked prompt or reply shows up.
 	var dump string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT coalesce(string_agg(r::text, ' '), '') FROM requests r`).Scan(&dump); err != nil {
@@ -406,8 +385,8 @@ func TestKeyCacheKeepsTheLookupOffRepeatRequests(t *testing.T) {
 		t.Fatal("a successful request did not populate the key cache")
 	}
 
-	// Deleting the project mid-flight proves the second request answered from
-	// cache: without it the lookup would fail and the request would 401.
+	// Deleting mid-flight proves the second request came from cache: otherwise the
+	// lookup fails and it 401s.
 	if _, err := pool.Exec(context.Background(),
 		`DELETE FROM projects WHERE key = 'lm_cache'`); err != nil {
 		t.Fatal(err)
@@ -443,31 +422,23 @@ func TestEstimatedCostUsesThePriceMap(t *testing.T) {
 	if got != 12 {
 		t.Errorf("estimatedCost = %v, want 12", got)
 	}
-	// An unpriced model must report zero rather than guess. The price map is
-	// hand-maintained (project-context.md), so this is the silent-$0 case.
+	// An unpriced model reports zero rather than guessing.
 	if got := estimatedCost("some-model-nobody-priced", 1_000_000, 1_000_000); got != 0 {
 		t.Errorf("estimatedCost for an unknown model = %v, want 0", got)
 	}
 }
 
-// Returning $0 for an unpriced model is deliberate - the price map is
-// hand-maintained and inventing a number would be worse than reporting none.
-// What is not deliberate is that it happens silently. A $0 cost means
-// cost_spike's baseline_multiple mode compares 0 against 0, which is never
-// greater, so an unpriced model quietly disables the product's headline alert
-// for that project and looks identical to everything working. The miss has to
-// surface somewhere, and the log is the cheapest place.
-//
-// Once per model, not once per request: a busy project on an unpriced model
-// would otherwise write a log line per call, which is how a warning becomes
-// invisible.
+// $0 for an unpriced model is deliberate, but it must not be silent: cost_spike
+// then compares 0 against 0, never fires, and looks identical to everything
+// working. Logged once per model, since one line per call is how a warning
+// becomes invisible.
 func TestUnpricedModelIsLoggedOnce(t *testing.T) {
 	var buf bytes.Buffer
 	restore := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	defer slog.SetDefault(restore)
 
-	// Unique per run so the once-only latch cannot leak in from another test.
+	// Unique per run, so the once-only latch cannot leak in from another test.
 	const model = "claude-opus-5-deliberately-absent-from-the-map"
 	estimatedCost(model, 1_000_000, 1_000_000)
 	estimatedCost(model, 500_000, 500_000)
@@ -480,11 +451,10 @@ func TestUnpricedModelIsLoggedOnce(t *testing.T) {
 	}
 }
 
-// The map is hand-maintained, so the models most likely to arrive have to
-// actually be in it - a miss is a $0 cost and a cost_spike rule that cannot
-// fire. Prices verified by hand against
-// https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-28.
-// When this fails, check the live page rather than guessing the new number.
+// The map is hand-maintained, and a miss is a $0 cost with a cost_spike rule
+// that cannot fire, so the likeliest models have to be in it. Verified against
+// platform.claude.com/docs/en/about-claude/pricing on 2026-07-28. On failure,
+// check the live page rather than guessing.
 func TestCurrentClaudeModelsArePriced(t *testing.T) {
 	for _, want := range []struct {
 		model         string
@@ -506,8 +476,8 @@ func TestCurrentClaudeModelsArePriced(t *testing.T) {
 	}
 }
 
-// Guard against the naive fix: logging on every lookup rather than only on a
-// miss would drown the warning above in noise from ordinary traffic.
+// Logging on every lookup rather than only on a miss would drown the warning
+// above in ordinary traffic.
 func TestPricedModelLogsNothing(t *testing.T) {
 	var buf bytes.Buffer
 	restore := slog.Default()
@@ -522,8 +492,8 @@ func TestPricedModelLogsNothing(t *testing.T) {
 }
 
 func TestJSONMarshalOfLogEntryCarriesNoBody(t *testing.T) {
-	// logEntry is the only per-request thing that reaches stdout. If a body
-	// field is ever added to it, this fails.
+	// logEntry is the only per-request thing reaching stdout, so adding a body
+	// field to it fails here.
 	b, err := json.Marshal(logEntry{Model: "claude-sonnet-5"})
 	if err != nil {
 		t.Fatal(err)
@@ -535,12 +505,9 @@ func TestJSONMarshalOfLogEntryCarriesNoBody(t *testing.T) {
 	}
 }
 
-// The startup check exists so a database that predates a schema change fails
-// immediately instead of turning every request into a 500. That only holds while
-// requiredColumns actually covers what saveRequest writes - and it silently
-// stopped covering it when validate_ms and upstream_ms were added, which is the
-// exact failure the check is for. Read the INSERT and compare, so the list
-// cannot drift from the code again.
+// The startup check only helps while requiredColumns covers what saveRequest
+// writes, and it silently stopped covering it once validate_ms and upstream_ms
+// were added. Read the INSERT and compare, so the list cannot drift again.
 func TestRequiredColumnsCoverTheInsert(t *testing.T) {
 	src, err := os.ReadFile("db.go")
 	if err != nil {
@@ -571,15 +538,12 @@ func TestRequiredColumnsCoverTheInsert(t *testing.T) {
 
 // --- serving stale when the database is unreachable -----------------------
 //
-// The proxy sits in the caller's request path, so a database it cannot reach
-// used to mean a 500 and a failed production call - a monitoring tool taking
-// down the thing it monitors. For a key already validated once, the last
-// known-good answer is served instead. The metadata is lost either way (if the
-// database cannot be read it cannot be written), so the only question these
-// cover is whether the caller's traffic dies with it.
+// The proxy sits in the caller's request path, so an unreachable database must
+// not 500 a key that has been validated before. The metadata is lost either way;
+// these cover whether the caller's traffic dies with it.
 
-// breakPool swaps the package pool for one pointing at a closed port, so every
-// query fails the way an outage makes them fail.
+// Swaps the package pool for one pointing at a closed port, so every query fails
+// the way an outage makes them fail.
 func breakPool(t *testing.T) {
 	t.Helper()
 	original := pool
@@ -594,10 +558,9 @@ func breakPool(t *testing.T) {
 	})
 }
 
-// staleEntry plants a cache entry that has expired but is still inside
-// keyCacheMaxStale, which is the state a real key is in partway through an
-// outage. Written directly because letting a real TTL elapse would mean a
-// 45-second test.
+// Plants an entry that has expired but is still inside keyCacheMaxStale, the
+// state a key is in partway through an outage. Written directly, since letting a
+// real TTL elapse would mean a 45-second test.
 func staleEntry(t *testing.T, key string, age time.Duration) {
 	t.Helper()
 	keys.mu.Lock()
@@ -628,8 +591,7 @@ func TestADatabaseOutageDoesNotBreakAKnownCustomersTraffic(t *testing.T) {
 }
 
 // The line between serving stale and being an open relay. An unknown key has no
-// entry to fall back on, so it must not be forwarded just because the database
-// is down.
+// entry to fall back on, so a database outage must not get it forwarded.
 func TestADatabaseOutageStillRefusesAnUnknownKey(t *testing.T) {
 	resetDB(t)
 	forwarded := false
@@ -649,8 +611,8 @@ func TestADatabaseOutageStillRefusesAnUnknownKey(t *testing.T) {
 	}
 }
 
-// Stale serving is bounded. Past keyCacheMaxStale the accepted revocation lag
-// and quota overshoot would grow without limit, so it fails closed again.
+// Bounded: past keyCacheMaxStale the revocation lag and quota overshoot would
+// grow without limit, so it fails closed again.
 func TestStaleServingStopsAtTheMaxStaleBound(t *testing.T) {
 	resetDB(t)
 	seedProject(t, "stale-expired")
@@ -672,16 +634,16 @@ func TestStaleServingStopsAtTheMaxStaleBound(t *testing.T) {
 	}
 }
 
-// A healthy database is unaffected: the fallback is reachable only through the
-// error branch, so normal traffic still gets a real lookup.
+// The fallback is reachable only through the error branch, so normal traffic
+// still gets a real lookup.
 func TestStaleFallbackDoesNotChangeTheHealthyPath(t *testing.T) {
 	resetDB(t)
 	seedProject(t, "stale-healthy")
 	stubUpstream(t, "anthropic", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, anthropicReply)
 	})
-	// Expired, but the database is up, so this must be refreshed rather than
-	// served stale - and the refreshed count comes from the real table.
+	// Expired, but the database is up, so this refreshes from the real table
+	// instead of being served stale.
 	staleEntry(t, "stale-healthy", time.Minute)
 
 	rec := post(t, "/anthropic/v1/messages", "stale-healthy", `{"model":"claude-sonnet-5"}`)
@@ -731,20 +693,16 @@ func TestGetStaleRespectsItsBounds(t *testing.T) {
 
 // --- the quota ladder ------------------------------------------------------
 //
-// The cap used to be a wall: at the limit, 429, request never forwarded. That
-// broke the caller's production app to make a pricing point. Now the ladder is
-//
 //	  under 1x limit  forward + record        (normal)
 //	  1x .. 2x        forward + record        (grace: alerts stay live)
 //	  2x .. 4x        forward, stop recording (product withdrawn, app fine)
 //	  4x and over     429                     (abuse ceiling only)
 //
-// and a repeat offender - two consecutive months over cap - skips the grace
-// row, losing recording at 1x instead of 2x. Forwarding is unchanged for them:
-// the 429 is abuse protection, never a monetisation lever.
+// A repeat offender, two consecutive months over cap, skips the grace row and
+// loses recording at 1x. Forwarding is unchanged for them.
 
-// seedProjectWithLimit makes a project whose owner and cap are set explicitly,
-// so a test can work with a limit of 2 instead of seeding 10,000 rows.
+// Owner and cap set explicitly, so a test can work with a limit of 2 instead of
+// seeding 10,000 rows.
 func seedProjectWithLimit(t *testing.T, key string, limit int, consecutiveCapMonths int) {
 	t.Helper()
 	userID := seedOwner(t, key, consecutiveCapMonths)
@@ -755,8 +713,8 @@ func seedProjectWithLimit(t *testing.T, key string, limit int, consecutiveCapMon
 	}
 }
 
-// fillUsage inserts n already-recorded requests in the current month, which is
-// what projectStatus counts.
+// Inserts n recorded requests in the current month, which is what projectStatus
+// counts.
 func fillUsage(t *testing.T, key string, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
@@ -780,7 +738,7 @@ func countRows(t *testing.T, key string) int {
 	return n
 }
 
-// okUpstream stubs anthropic and reports whether it was reached.
+// Stubs anthropic and reports whether it was reached.
 func okUpstream(t *testing.T) *bool {
 	t.Helper()
 	reached := false
@@ -792,8 +750,8 @@ func okUpstream(t *testing.T) *bool {
 	return &reached
 }
 
-// Inside the grace window the product still works: this is the window where a
-// runaway agent is most likely, so the alerts have to keep evaluating.
+// Inside the grace window the product still works, since this is when a runaway
+// agent is most likely and alerts have to keep evaluating.
 func TestInsideTheGraceWindowItStillRecords(t *testing.T) {
 	resetDB(t)
 	seedProjectWithLimit(t, "q-grace", 2, 0)
@@ -813,8 +771,8 @@ func TestInsideTheGraceWindowItStillRecords(t *testing.T) {
 	}
 }
 
-// Past the grace multiple the product is withdrawn - no row, so the dashboard
-// goes dark and alerts stop - but the call still goes through.
+// Past the grace multiple there is no row, so the dashboard goes dark and alerts
+// stop, but the call still goes through.
 func TestPastTheGraceWindowItForwardsWithoutRecording(t *testing.T) {
 	resetDB(t)
 	seedProjectWithLimit(t, "q-nolog", 2, 0)
@@ -851,8 +809,8 @@ func TestAtTheAbuseCeilingItRefuses(t *testing.T) {
 	}
 }
 
-// A second consecutive month over cap skips the grace row: recording stops at
-// the cap itself. Forwarding is deliberately unchanged.
+// A second consecutive month over cap stops recording at the cap itself.
+// Forwarding is unchanged.
 func TestARepeatOffenderLosesTheGraceWindow(t *testing.T) {
 	resetDB(t)
 	seedProjectWithLimit(t, "q-repeat", 2, 2)
@@ -872,8 +830,7 @@ func TestARepeatOffenderLosesTheGraceWindow(t *testing.T) {
 	}
 }
 
-// A first offender at exactly 1x still gets the grace window, which is the
-// difference the counter buys.
+// A first offender at exactly 1x still gets the grace window.
 func TestAFirstOffenderKeepsRecordingAtTheCap(t *testing.T) {
 	resetDB(t)
 	seedProjectWithLimit(t, "q-first", 2, 0)
@@ -907,15 +864,10 @@ func TestAnUncappedProjectIsNeverThrottledOrSilenced(t *testing.T) {
 	}
 }
 
-// schema.sql is what someone running this proxy on its own applies, and
-// requiredColumns is what the proxy refuses to start without. They are two
-// hand-written lists of the same thing, so they drift.
-//
-// They did drift: the quota ladder taught projectStatus to join users, and this
-// module shipped a schema.sql with no users table in it. Production was fine,
-// because the private database has one, so nothing here would have noticed. The
-// only person it broke was whoever cloned the public repo and followed its own
-// setup instructions.
+// schema.sql and requiredColumns are two hand-written lists of the same thing,
+// so they drift. They already did once: projectStatus started joining users while
+// schema.sql had no users table, which broke only the people who cloned this
+// module and followed its own setup instructions.
 func TestTheShippedSchemaSatisfiesTheStartupCheck(t *testing.T) {
 	src, err := os.ReadFile("schema.sql")
 	if err != nil {

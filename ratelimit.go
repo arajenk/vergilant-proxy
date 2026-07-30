@@ -7,41 +7,28 @@ import (
 	"time"
 )
 
-// Rate-limiting has two independent layers, doing two different jobs:
-//
-//  1. The monthly per-project cap lives in Postgres, counted in db.go. It's a
-//     durable quota that MUST survive a restart, so it can't be in memory.
-//     See monthlyLimit / projectStatus.
-//  2. The per-project token bucket below is an in-memory abuse guardrail: it
-//     stops a single project (e.g. a runaway agent looping thousands of times
-//     a second) from hammering the database and the upstream provider. Losing
-//     this state on restart is harmless, so in-memory is the right home.
-//
-// These are guardrails against pathological bursts, NOT the customer-facing
-// usage limit, and they're set generously so normal bursty traffic sails
-// through.
+// Two independent layers limit a project. The monthly cap is durable and lives
+// in Postgres (see monthlyLimit and projectStatus). The token bucket below is an
+// in-memory guardrail against pathological bursts, like a runaway agent looping
+// thousands of times a second; losing it on restart is harmless. It is not the
+// customer-facing limit, so it is set generously.
 const (
 	burstSize       = 30
 	refillPerSecond = 10
 )
 
-// Set via MONTHLY_REQUEST_LIMIT (0 disables it); main sets this at startup.
-// It's the default for projects that don't set their own: a project's
-// monthly_request_limit column overrides this when it's non-NULL. The handler
-// picks between the two and does the enforcing; projectStatus in db.go just
-// reports the column and the count.
+// Set from MONTHLY_REQUEST_LIMIT at startup, 0 to disable. This is the default
+// for projects with no monthly_request_limit of their own.
 var monthlyLimit int = quota.DefaultFreeMonthlyLimit
 
-// tokens is fractional so a partial refill between requests isn't rounded
-// away.
+// Fractional tokens, so a partial refill between requests is not rounded away.
 type bucket struct {
 	tokens float64
 	last   time.Time
 }
 
-// Only ever gets entries for keys that already passed validation (allow is
-// called after projectStatus), so it's bounded by the number of real
-// projects. No reaper needed, and a flood of garbage keys can't grow it.
+// Only holds keys that passed validation, since allow runs after projectStatus,
+// so it is bounded by the number of real projects and needs no reaper.
 type limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -57,8 +44,8 @@ func newLimiter(rate, burst float64) *limiter {
 	}
 }
 
-// allow reports whether the project may make one more request right now,
-// spending a token if so.
+// allow reports whether the project may make one more request, spending a token
+// if so.
 func (l *limiter) allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -66,7 +53,7 @@ func (l *limiter) allow(key string) bool {
 	now := time.Now()
 	b := l.buckets[key]
 	if b == nil {
-		// Start full so a fresh project isn't throttled before it's done anything.
+		// Start full, so a new project is not throttled immediately.
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	}

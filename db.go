@@ -10,26 +10,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// modelPrice is USD per million tokens, matching how Anthropic (and the
-// rest of the industry) publishes pricing.
+// USD per million tokens, matching how providers publish pricing.
 type modelPrice struct {
 	InputPerMillion  float64
 	OutputPerMillion float64
 }
 
-// Hardcoded, updated by hand. A model missing from here costs $0, which is
-// worse than it sounds: see estimatedCost below.
+// Maintained by hand. A missing model costs $0; see estimatedCost.
 //
-// The Claude rows were verified against
-// https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-28.
-// Sonnet 5 is at introductory pricing ($2/$10 per million) through
-// 2026-08-31; it reverts to $3/$15 on 2026-09-01, which is a diary entry, not
-// something this map notices on its own.
-//
-// The OpenAI rows below are NOT verified. openai.com/api/pricing refused
-// automated fetches on 2026-07-28 and the third-party trackers disagreed with
-// each other, so they are left as they were rather than updated from a source
-// that might be wrong. Check the live page by hand before trusting them.
+// Claude rows verified against platform.claude.com/docs/en/about-claude/pricing
+// on 2026-07-28. Sonnet 5 is on introductory pricing until 2026-08-31, then
+// reverts to $3/$15. The OpenAI rows are unverified.
 var priceMap = map[string]modelPrice{
 	"claude-fable-5":            {InputPerMillion: 10, OutputPerMillion: 50},
 	"claude-opus-5":             {InputPerMillion: 5, OutputPerMillion: 25},
@@ -46,16 +37,14 @@ var priceMap = map[string]modelPrice{
 	"o3-mini":      {InputPerMillion: 1.1, OutputPerMillion: 4.4},
 }
 
-// Which unpriced models have already been warned about, so each one produces
-// a single log line instead of one per request.
+// Models already warned about, so each produces one log line rather than one
+// per request.
 var (
 	unpricedMu   sync.Mutex
 	unpricedSeen = map[string]bool{}
 )
 
-// warnUnpricedOnce reports a model missing from priceMap, the first time that
-// model is seen. Only the model name is logged, which is metadata like every
-// other field the proxy records.
+// Logs the model name only, which is metadata like every other field recorded.
 func warnUnpricedOnce(model string) {
 	unpricedMu.Lock()
 	defer unpricedMu.Unlock()
@@ -71,11 +60,9 @@ func warnUnpricedOnce(model string) {
 func estimatedCost(model string, inputTokens, outputTokens int) float64 {
 	price, ok := priceMap[model]
 	if !ok {
-		// Zero rather than a guess: the map is hand-maintained and an invented
-		// price would corrupt every cost number downstream. But zero is not a
-		// harmless default either - cost_spike compares spend against a
-		// baseline, and 0 is never greater than 5x0 - so the miss gets said
-		// out loud instead of being absorbed.
+		// Zero rather than a guess, since an invented price corrupts every cost
+		// number downstream. Zero is not harmless either: cost_spike compares
+		// spend against a baseline, and 0 never exceeds 5x0. Hence the warning.
 		warnUnpricedOnce(model)
 		return 0
 	}
@@ -90,10 +77,9 @@ type requestRecord struct {
 	Model      string
 	Status     int
 	LatencyMs  int64
-	// The split of LatencyMs: our own key lookup, and the provider's time.
-	// Pointers because a request that failed before it reached either stage
-	// has no honest number to report, and a zero would read as "we added
-	// nothing" rather than "not measured".
+	// The split of LatencyMs: the key lookup, and the provider's time. Pointers
+	// because a request that failed before either stage has no number to report,
+	// and a zero would read as "added nothing" rather than "not measured".
 	ValidateMs       *int64
 	UpstreamMs       *int64
 	FirstTokenMs     *int64
@@ -108,8 +94,8 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	// pgxpool.New doesn't connect eagerly, so ping now to fail at startup
-	// instead of on the first proxied request.
+	// pgxpool.New does not connect eagerly, so ping to fail at startup rather
+	// than on the first proxied request.
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -117,22 +103,17 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// Single round-trip on the hot path. The month count is derived from the
-// requests table itself, the single source of truth, rather than a separate
-// counter, so there's nothing to keep in sync. The (project_key, timestamp)
-// index in schema.sql keeps this a cheap range count. now() is UTC in
-// Postgres, so date_trunc gives a UTC month boundary.
+// One round-trip on the hot path. The month count comes from the requests table
+// rather than a counter, so there is nothing to keep in sync; the
+// (project_key, timestamp) index keeps it a cheap range count. Postgres now() is
+// UTC, so date_trunc gives a UTC month boundary.
 //
-// An unknown key returns pgx.ErrNoRows - selecting FROM projects rather than
-// asking EXISTS is what keeps the per-project limit on the same round-trip.
-// limit is nil when the column is NULL, meaning "use monthlyLimit"; the caller
-// resolves that, so this file doesn't reach into ratelimit.go's config.
-// capMonths is how many consecutive whole months the owning account has
-// finished over its cap. The quota ladder uses it to decide whether this
-// project still gets its grace window - see the quota package.
+// An unknown key returns pgx.ErrNoRows. limit is nil for a NULL column, meaning
+// "use monthlyLimit", which the caller resolves. capMonths is the owner's
+// consecutive whole months over cap, which the quota package reads.
 //
-// LEFT JOIN and COALESCE because projects.user_id is nullable: a project with
-// no owner has no history, which is the same as a clean one.
+// LEFT JOIN and COALESCE because projects.user_id is nullable: an unowned
+// project has no history, same as a clean one.
 func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (limit *int, monthCount, capMonths int, err error) {
 	err = pool.QueryRow(ctx, `
 		SELECT

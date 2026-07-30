@@ -9,24 +9,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The columns this program actually reads or writes. Checked once at startup
-// so a database that predates a schema change fails immediately, with the
-// missing column named, instead of turning every proxied request into a 500.
+// What the two queries in db.go touch, not every column in schema.sql. Checked
+// at startup so a database that predates a schema change fails immediately,
+// naming the missing column, instead of 500ing every request.
 //
-// This module is standalone and ships its own schema.sql covering just the two
-// tables it touches, applied by hand. That file is what this check refers to.
-// The full Vergilant service keeps the same tables under an ordered migration
-// runner instead; if you are looking at that repo, the fix is to run the
-// migrations, not to apply this file over them.
-//
-// If you add a column to the proxy's schema.sql and start using it, add it here
-// too. The list is short on purpose: it's what the two queries in db.go touch,
-// not every column in the file.
+// Add to this when you add a column here and start using it. The full Vergilant
+// service keeps the same tables under an ordered migration runner, where the fix
+// is to run the migrations rather than apply schema.sql over them.
 var requiredColumns = map[string][]string{
 	"projects": {"key", "monthly_request_limit", "user_id"},
-	// Read by projectStatus for the quota ladder: without it the proxy cannot
-	// tell a first offence from a repeat one, and would hand back the grace
-	// window every month.
+	// Read by projectStatus. Without it the proxy cannot tell a first offence
+	// from a repeat one, and hands back the grace window every month.
 	"users": {"id", "consecutive_cap_months"},
 	"requests": {
 		"project_key", "timestamp", "provider", "model", "status",
@@ -35,8 +28,7 @@ var requiredColumns = map[string][]string{
 	},
 }
 
-// checkSchema reports every required column the database is missing, in one
-// error, so re-running after a fix doesn't reveal them one at a time.
+// Reports every missing column in one error, rather than one per re-run.
 func checkSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	rows, err := pool.Query(ctx, `
 		SELECT table_name, column_name
@@ -69,7 +61,7 @@ func checkSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	if len(missing) > 0 {
-		// Sorted so the message is stable across runs; Go randomizes map order.
+		// Stable message: Go randomizes map order.
 		slices.Sort(missing)
 		return fmt.Errorf("database is missing %s; apply the proxy's schema.sql",
 			strings.Join(missing, ", "))

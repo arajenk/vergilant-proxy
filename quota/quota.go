@@ -1,66 +1,49 @@
-// Package quota is the monthly request policy: what happens to a request once
-// a project has used more than its plan allows.
+// Package quota is the monthly request policy: what happens to a request once a
+// project has used more than its plan allows.
 //
-// It lives in the proxy module rather than the private one for two reasons.
-// The proxy is where the policy is actually enforced, so this is its home. And
-// the proxy is mirrored to a public repo, so anyone reading it can see exactly
-// what the limits do - which is the whole point of the core being public. A
-// package in the private module could not be imported here without dragging
-// that module into the mirror, so the dependency runs this way round: the
-// private services import the public policy, never the reverse.
-//
-// Before this package the numbers were copied into three modules and kept in
-// step by a test that scraped the proxy's source for them. This replaces that
-// with the compiler.
+// It lives in the proxy module because that is where the policy is enforced, and
+// because the proxy is the public mirror, so the limits are readable. The
+// dependency only runs one way: the private services import this package, never
+// the reverse.
 package quota
 
-// The ladder.
-//
-// The cap used to be a wall: at the limit, refuse the request and stop
-// forwarding. That breaks the caller's production app to make a pricing point,
-// and someone whose site goes down deletes the tool rather than upgrading it.
-// So the cap withdraws the product instead: past the grace window nothing is
-// recorded, which takes the dashboard dark and stops alerts, while the calls
-// themselves keep flowing.
+// Past the limit the cap withdraws the product rather than the traffic: nothing
+// is recorded, so the dashboard goes dark and alerts stop, but calls keep
+// flowing. Refusing at the limit instead would break the caller's production app
+// to make a pricing point.
 const (
-	// GraceMultiple is how far past the limit a first offender is still
-	// recorded. Alerts keep evaluating through the start of a spike, which is
-	// exactly when a runaway agent is most likely and the worst possible moment
-	// to go blind.
+	// How far past the limit a first offender is still recorded. Alerts keep
+	// evaluating through the start of a spike, which is when a runaway agent is
+	// most likely.
 	GraceMultiple = 2
 
-	// CeilingMultiple is where forwarding finally stops. This is abuse
-	// protection so a free tier cannot be an unlimited proxy forever, and it is
-	// never a monetisation lever - a repeat offender is forwarded to exactly
+	// Where forwarding stops. Abuse protection, so a free tier cannot be an
+	// unlimited proxy forever. Never a monetisation lever: a repeat offender gets
 	// the same ceiling as everyone else.
 	CeilingMultiple = 4
 
-	// RepeatOffenderMonths is how many consecutive finished months over the cap
-	// cost an account its grace window. Two means a whole month of notices has
-	// already gone unanswered.
+	// Consecutive finished months over cap that cost an account its grace window.
+	// Two means a whole month of notices went unanswered.
 	RepeatOffenderMonths = 2
 
-	// DefaultFreeMonthlyLimit is the cap a project gets when it stores no
-	// override. Overridable per deployment via MONTHLY_REQUEST_LIMIT, but this
-	// is the number the free plan, the dashboard meter and the notice emails
-	// all have to agree on.
+	// The cap for a project storing no override. Overridable per deployment via
+	// MONTHLY_REQUEST_LIMIT, but the free plan, the dashboard meter and the
+	// notice emails all have to agree on this number.
 	DefaultFreeMonthlyLimit = 10000
 )
 
 // State is the decision for one request.
 type State struct {
-	// Refuse means answer 429 without forwarding. Only ever true at the abuse
-	// ceiling.
+	// Answer 429 without forwarding. Only true at the abuse ceiling.
 	Refuse bool
-	// Record means write the metadata row. False past the grace window: the
-	// call still happens, we simply stop keeping the receipt.
+	// Write the metadata row. False past the grace window, where the call still
+	// happens but no receipt is kept.
 	Record bool
 }
 
-// For decides what to do with one request.
-//
-// limit <= 0 means uncapped - which is every paid project, since 0 is what the
-// billing webhook writes - and no part of the ladder applies.
+// For decides what to do with one request. limit <= 0 means uncapped, which is
+// every paid project since 0 is what the billing webhook writes, and no part of
+// the ladder applies.
 func For(limit, used, capMonths int) State {
 	if limit <= 0 {
 		return State{Record: true}
@@ -71,11 +54,9 @@ func For(limit, used, capMonths int) State {
 	return State{Record: used < RecordingStopsAt(limit, capMonths)}
 }
 
-// RecordingStopsAt is the usage at which metadata stops being written.
-//
-// Exported separately because the dashboard and the notice emails both have to
-// quote this number, and neither of them is deciding about a request. Returns 0
-// for an uncapped project, which has no threshold to report.
+// RecordingStopsAt is the usage at which metadata stops being written. Exported
+// because the dashboard and the notice emails have to quote it without deciding
+// about a request. Returns 0 for an uncapped project, which has no threshold.
 func RecordingStopsAt(limit, capMonths int) int {
 	if limit <= 0 {
 		return 0

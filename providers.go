@@ -6,17 +6,16 @@ import (
 	"time"
 )
 
-// Adding a provider means adding one entry here, its price-map rows in
-// db.go, and an SSE line parser alongside the two below if it streams.
+// A new provider needs an entry here, price rows in db.go, and an SSE line
+// parser below if it streams.
 var providers = map[string]string{
 	"anthropic": "https://api.anthropic.com",
 	"openai":    "https://api.openai.com",
 }
 
-// splitProviderPath reads the leading path segment as a provider name and
-// returns the remaining path to forward upstream: "/openai/v1/chat/completions"
-// becomes ("openai", "/v1/chat/completions", true). ok is false if the path
-// has no second segment or the first segment isn't a known provider.
+// splitProviderPath turns "/openai/v1/chat/completions" into
+// ("openai", "/v1/chat/completions", true). ok is false for an unknown provider
+// or a path with no second segment.
 func splitProviderPath(path string) (provider, rest string, ok bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	provider, rest, found := strings.Cut(trimmed, "/")
@@ -29,9 +28,9 @@ func splitProviderPath(path string) (provider, rest string, ok bool) {
 	return provider, "/" + rest, true
 }
 
-// Anthropic pairs each event with an "event:" line naming it and a "data:"
-// line carrying its JSON payload, so currentEvent tracks which event the
-// next data line belongs to.
+// Anthropic names each event on an "event:" line and puts its payload on the
+// following "data:" line, so currentEvent tracks which event that data belongs
+// to.
 func parseAnthropicSSELine(text string, currentEvent *string, inputTokens, outputTokens *int, firstTokenAt *time.Time) {
 	switch {
 	case strings.HasPrefix(text, "event:"):
@@ -71,11 +70,10 @@ func parseAnthropicSSELine(text string, currentEvent *string, inputTokens, outpu
 	}
 }
 
-// Unlike Anthropic, OpenAI has no "event:" line, every line is a bare
-// "data: {...}" chunk, terminated by a final "data: [DONE]". Usage only
-// shows up in the last chunk, and only if the request set
-// stream_options.include_usage, so requests that skip it just show zero
-// tokens for a streamed response.
+// OpenAI has no "event:" line: every line is a bare "data: {...}" chunk, ending
+// with "data: [DONE]". Usage appears only in the last chunk, and only if the
+// request set stream_options.include_usage, so requests without it report zero
+// tokens.
 func parseOpenAISSELine(text string, inputTokens, outputTokens *int, firstTokenAt *time.Time) {
 	if !strings.HasPrefix(text, "data:") {
 		return

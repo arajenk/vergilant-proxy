@@ -26,23 +26,17 @@ import (
 
 var pool *pgxpool.Pool
 
-// The authoritative monthly cap is enforced separately, in Postgres (see
-// ratelimit.go).
+// Burst guardrail. The monthly cap is enforced in Postgres; see ratelimit.go.
 var rl = newLimiter(refillPerSecond, burstSize)
 
-// Positive key validations, cached briefly so repeat traffic skips the
-// cross-region DB check on the hot path. See keycache.go for the tradeoffs.
 var keys = newKeyCache()
 
-// LLM requests can be large (long context, base64 images), so this default
-// is generous. Override with MAX_REQUEST_BYTES.
+// Generous by default: long context and base64 images. Override with
+// MAX_REQUEST_BYTES.
 var maxRequestBytes int64 = 25 << 20 // 25 MiB
 
-// The timeouts are on the Transport, not the Client: Client.Timeout would
-// cap the whole request including reading the body, which for a long-lived
-// SSE stream would truncate it mid-response. ResponseHeaderTimeout instead
-// bounds only how long we wait for the upstream to START responding, leaving
-// streaming bodies free to run as long as needed.
+// Timeouts belong on the Transport, not the Client. Client.Timeout would cap
+// the whole request including the body read, truncating long-lived SSE streams.
 var httpClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -50,13 +44,11 @@ var httpClient = &http.Client{
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
 		MaxIdleConns:          100,
-		// Default per-host is 2. With only two warm connections to a provider,
-		// concurrent traffic keeps opening fresh ones, paying a TCP+TLS
-		// handshake RTT each time; keeping more idle keeps them hot.
+		// Default per-host is 2, which makes concurrent traffic re-handshake
+		// constantly.
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
-		// Setting DialContext above otherwise disables HTTP/2; re-enable it so
-		// concurrent requests can multiplex over one provider connection.
+		// Setting DialContext disables HTTP/2 unless re-enabled here.
 		ForceAttemptHTTP2: true,
 	},
 }
@@ -65,9 +57,8 @@ type requestBody struct {
 	Model string `json:"model"`
 }
 
-// Usage carries both providers' field names for the same two numbers.
-// Anthropic and OpenAI never populate the same pair, so tokens() below just
-// returns whichever pair is non-zero.
+// Carries both providers' names for the same two numbers. Only one pair is
+// ever populated.
 type responseBody struct {
 	Usage struct {
 		InputTokens      int `json:"input_tokens"`
@@ -100,8 +91,7 @@ type logEntry struct {
 	FirstTokenMs int64  `json:"first_token_ms,omitempty"`
 }
 
-// The only place per-request info gets logged; only ever metadata, never
-// bodies.
+// The only per-request log. Metadata only, never bodies.
 func logRequest(e logEntry) {
 	slog.Info("request",
 		"method", e.Method,
@@ -119,12 +109,6 @@ func logRequest(e logEntry) {
 	)
 }
 
-// The quota ladder lives in the quota package, so the proxy, the alerts daemon
-// and the api all read one definition instead of three copies kept in step by
-// hand. It is in this module because this is where it is enforced, and because
-// this module is the public mirror - the limits should be readable by anyone
-// looking at the core.
-
 func recordRequest(ctx context.Context, rec requestRecord, record bool) {
 	if !record {
 		return
@@ -134,12 +118,8 @@ func recordRequest(ctx context.Context, rec requestRecord, record bool) {
 	}
 }
 
-// Search Console holds vergilant.dev as a domain property, which covers every
-// subdomain, so Googlebot reaches this host too. Nothing here is worth
-// indexing - every path either 404s or needs a customer's API key - and
-// without this the crawler is told nothing, which Google reads as "crawl
-// freely". The result is junk 404s in the site's Pages report and pointless
-// load on a service that exists to carry customer traffic.
+// Crawlers reach this host via the vergilant.dev domain property. Nothing here
+// is indexable: every path either 404s or needs a customer's API key.
 func robotsHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	io.WriteString(w, "User-agent: *\nDisallow: /\n")
@@ -149,58 +129,47 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	projectKey := r.Header.Get("X-Monitor-Key")
 
-	// Checked before the project key so a garbage path 404s without a DB
-	// round-trip.
+	// Before the key check, so a bad path 404s without a DB round-trip.
 	provider, forwardPath, ok := splitProviderPath(r.URL.Path)
 	if !ok {
 		http.Error(w, "unknown provider; use /anthropic/... or /openai/...", http.StatusNotFound)
 		return
 	}
 
-	// A brief positive cache keeps this cross-region DB round-trip off the hot
-	// path for repeat traffic. A miss falls through to the DB, so a new key
-	// works immediately; only positive results are cached (see keycache.go).
-	// Rejected requests aren't saved: an unknown key can't be attributed to a
-	// project, and a refused request never reaches upstream.
+	// A hit skips the cross-region DB round-trip; a miss falls through, so a new
+	// key works immediately. Rejected requests are not recorded: an unknown key
+	// belongs to no project.
 	validateStart := time.Now()
 	monthCount, limit, capMonths, cached := keys.get(projectKey)
 	if !cached {
 		projectLimit, cnt, months, err := projectStatus(r.Context(), pool, projectKey)
-		// No row means no such project. This has to be checked before the
-		// generic error below, or an unknown key would 500 instead of 401.
+		// Must precede the generic error below, or an unknown key 500s.
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "unknown project key", http.StatusUnauthorized)
 			return
 		}
 		if err != nil {
-			// The database is unreachable - it is not answering "no such key",
-			// which was handled above. Rather than fail a request for a key we
-			// have already validated before, serve the last known-good answer.
-			//
-			// The metadata for this request is lost either way: if the database
-			// cannot be read it cannot be written either, so saveRequest is
-			// going to fail too. The only thing in question is whether we also
-			// break the caller's production traffic on the way out, and a
-			// monitoring tool should not be able to do that. Note this is not
-			// blanket fail-open: an unknown key has no cache entry, so it still
-			// gets the 500 below rather than being forwarded.
+			// The database is unreachable rather than saying "no such key". For a
+			// key validated before, serve the last known-good answer instead of
+			// failing the caller's production traffic. The metadata is lost either
+			// way, since a database that cannot be read cannot be written. Not
+			// fail-open: an unknown key has no entry and still 500s below.
 			staleCount, staleLimit, staleMonths, stale := keys.getStale(projectKey)
 			if !stale {
 				slog.Error("failed to validate project key", "err", err)
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
-			// Warn, not Error: the request is being served. This is the line
-			// that says quota enforcement is running blind right now.
+			// Warn, not Error: the request is served, but quota enforcement is
+			// running blind.
 			slog.Warn("database unreachable, serving stale key status",
 				"err", err, "max_stale", keyCacheMaxStale)
 			monthCount, limit, capMonths = staleCount, staleLimit, staleMonths
-			// Deliberately no keys.put: re-caching would reset the expiry and
-			// let a long outage renew itself past keyCacheMaxStale forever.
+			// No keys.put: re-caching would reset the expiry and let a long
+			// outage renew itself past keyCacheMaxStale forever.
 		} else {
-			// A NULL column means this project has no override and gets the
-			// configured default. Resolved once, here, so the cache and the
-			// check below both deal in a plain number.
+			// NULL means no override, so use the configured default. Resolved
+			// here so everything downstream deals in a plain number.
 			limit = monthlyLimit
 			if projectLimit != nil {
 				limit = *projectLimit
@@ -211,9 +180,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	validateMs := time.Since(validateStart).Milliseconds()
 
-	// Bounded overshoot under high concurrency is acceptable for a soft quota,
-	// and the burst check below limits it further. A cached count can also be
-	// up to keyCacheTTL stale, widening that overshoot within the tolerance.
+	// Soft quota, so bounded overshoot is fine: concurrent requests race, and a
+	// cached count can be up to keyCacheTTL stale.
 	q := quota.For(limit, monthCount, capMonths)
 	if q.Refuse {
 		http.Error(w, "monthly request limit exceeded by too much; contact support", http.StatusTooManyRequests)
@@ -241,7 +209,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	var reqParsed requestBody
-	json.Unmarshal(reqBytes, &reqParsed) // best-effort; missing/bad JSON just leaves Model empty
+	json.Unmarshal(reqBytes, &reqParsed) // best-effort; bad JSON leaves Model empty
 
 	proxyReq, err := http.NewRequest(r.Method, providers[provider]+forwardPath, bytes.NewReader(reqBytes))
 	if err != nil {
@@ -250,15 +218,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxyReq.Header = r.Header.Clone()
-	// Ours, not the provider's. Cloning the caller's headers is what forwards
-	// their API key untouched, which is the point - but this one identifies a
-	// Vergilant project and has no business in Anthropic's or OpenAI's request
-	// logs. They would ignore it; that is not a reason to send it.
+	// Cloning forwards the caller's provider key untouched, which is the point.
+	// This header is ours and has no business in a provider's logs.
 	proxyReq.Header.Del("X-Monitor-Key")
-	// Force plaintext so the streaming path can parse SSE text directly;
-	// otherwise http.DefaultClient only auto-decompresses gzip when it set
-	// Accept-Encoding itself, and a client-supplied value would leave
-	// resp.Body as raw gzip bytes.
+	// Plaintext, so the streaming path can parse SSE text. Go only
+	// auto-decompresses gzip when it set Accept-Encoding itself, so a
+	// client-supplied value would leave resp.Body as raw gzip bytes.
 	proxyReq.Header.Set("Accept-Encoding", "identity")
 
 	upstreamStart := time.Now()
@@ -284,7 +249,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var respParsed responseBody
-	json.Unmarshal(respBytes, &respParsed) // best-effort; e.g. streamed SSE bodies won't parse, leaving zero token counts
+	json.Unmarshal(respBytes, &respParsed) // best-effort; an unparseable body leaves zero tokens
 	inputTokens, outputTokens := respParsed.tokens()
 
 	for k, v := range resp.Header {
@@ -292,9 +257,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBytes)
-	// Push the response to the client now, so the metadata DB write below is
-	// off the client's critical path. Without this, net/http buffers a small
-	// body until the handler returns, which is after saveRequest completes.
+	// Flush now, or net/http holds a small body until the handler returns and the
+	// metadata write below lands on the client's critical path.
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -343,11 +307,10 @@ func saveFailure(r *http.Request, projectKey, provider string, start time.Time, 
 	recordRequest(r.Context(), rec, record)
 }
 
-// streamResponse passes an SSE response through to the client one line at a
-// time, flushing after every write so tokens show up as they arrive instead
-// of after the whole response lands. Alongside the passthrough it watches the
-// same bytes to recover token counts and first-token latency, since that info
-// is spread across multiple events instead of sitting in one JSON object.
+// streamResponse relays an SSE response line by line, flushing after each write
+// so tokens arrive as they are produced. It reads the same bytes to recover
+// token counts and first-token latency, which are spread across events rather
+// than sitting in one JSON object.
 func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, reqParsed requestBody, projectKey, provider string, validateMs, upstreamMs int64, cached, record bool) {
 	for k, v := range resp.Header {
 		w.Header()[k] = v
@@ -377,7 +340,7 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 			}
 		}
 		if err != nil {
-			break // EOF, or upstream connection dropped; headers are already sent, nothing more to do
+			break // EOF or dropped connection; headers are already sent
 		}
 	}
 
@@ -419,9 +382,6 @@ func streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response,
 	recordRequest(r.Context(), rec, record)
 }
 
-// No provider API key is required, or read anywhere in this program. Each
-// client request carries its own provider auth header, forwarded upstream
-// unchanged; the proxy never holds a key of its own.
 func requireEnv(names ...string) {
 	var missing []string
 	for _, name := range names {
@@ -438,8 +398,8 @@ func requireEnv(names ...string) {
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	// A missing .env is fine in production, where the platform sets
-	// variables directly; requireEnv below is what actually enforces them.
+	// A missing .env is fine in production, where the platform sets the
+	// variables. requireEnv below is what enforces them.
 	if err := godotenv.Load(); err != nil {
 		slog.Info("no .env file found; relying on the process environment")
 	}
@@ -472,17 +432,14 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Same spirit as requireEnv above: fail at startup with one clear message
-	// rather than turning every proxied request into a 500 because the
-	// database predates a column this build expects.
+	// Fail at startup with one clear message, rather than 500ing every request
+	// because the database predates a column this build expects.
 	if err := checkSchema(context.Background(), pool); err != nil {
 		slog.Error("refusing to start", "err", err)
 		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
-	// Registered before "/" only for readability; ServeMux matches the most
-	// specific pattern regardless of order, so this wins over the catch-all.
 	mux.HandleFunc("/robots.txt", robotsHandler)
 	mux.HandleFunc("/", handler)
 	srv := &http.Server{
@@ -491,8 +448,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second, // bound slow-header (slowloris) clients
 	}
 
-	// A clean ListenAndServe returns http.ErrServerClosed after Shutdown; any
-	// other error means the listener itself failed and is fatal.
+	// ErrServerClosed is the normal Shutdown path; anything else means the
+	// listener failed and is fatal.
 	go func() {
 		slog.Info("proxy listening on :8080, forwarding /anthropic and /openai")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -501,9 +458,8 @@ func main() {
 		}
 	}()
 
-	// Fly (and most platforms) send SIGTERM on deploy/stop. Shutdown stops
-	// accepting new connections and waits up to the grace period for in-flight
-	// requests, including long-lived streams, to finish before we exit.
+	// Fly sends SIGTERM on deploy. Shutdown stops accepting connections and
+	// drains in-flight requests, including long-lived streams.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
