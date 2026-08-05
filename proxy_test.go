@@ -887,3 +887,62 @@ func TestTheShippedSchemaSatisfiesTheStartupCheck(t *testing.T) {
 		}
 	}
 }
+
+// The upstream URL is built from r.URL.Path, which does not carry the query
+// string. Any endpoint taking parameters - listing models, pagination - would
+// reach the provider without them, and silently: the call still succeeds, it
+// just answers a different question than the caller asked.
+func TestTheQueryStringSurvivesForwarding(t *testing.T) {
+	resetDB(t)
+	seedProject(t, "lm_query")
+
+	var gotURI string
+	stubUpstream(t, "anthropic", func(w http.ResponseWriter, r *http.Request) {
+		gotURI = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, anthropicReply)
+	})
+
+	rec := post(t, "/anthropic/v1/models?limit=5&after=abc", "lm_query", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if want := "/v1/models?limit=5&after=abc"; gotURI != want {
+		t.Errorf("upstream received %q, want %q", gotURI, want)
+	}
+}
+
+// recordRequest runs after the response has been written, carrying r.Context().
+// net/http cancels that context when the client's connection closes, so a caller
+// that hangs up as soon as it has its answer loses the metadata row entirely.
+// The streaming path has it worse: a dropped connection is precisely what ends
+// its read loop, so the disconnect and the lost row arrive together.
+func TestMetadataIsRecordedEvenIfTheCallerDisconnects(t *testing.T) {
+	resetDB(t)
+	seedProject(t, "lm_disc")
+
+	stubUpstream(t, "anthropic", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, anthropicReply)
+	})
+
+	// Warm the cache so key validation is not what fails: the point is the write
+	// after the response, not the lookup before it.
+	keys.put("lm_disc", 0, 0, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the caller is already gone by the time we go to record
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages",
+		strings.NewReader(`{"model":"claude-sonnet-5"}`)).WithContext(ctx)
+	req.Header.Set("X-Monitor-Key", "lm_disc")
+	handler(httptest.NewRecorder(), req)
+
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM requests WHERE project_key = 'lm_disc'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("recorded %d rows, want 1 - metadata lost because the caller hung up", n)
+	}
+}

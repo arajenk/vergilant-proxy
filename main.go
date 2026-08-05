@@ -113,6 +113,15 @@ func recordRequest(ctx context.Context, rec requestRecord, record bool) {
 	if !record {
 		return
 	}
+	// Detached from the request context on purpose. net/http cancels that context
+	// when the caller's connection closes, and this write happens after the
+	// response has already gone out - so a client that hangs up the moment it has
+	// its answer would take the metadata row with it. The streaming path is worse:
+	// a dropped connection is exactly what ends its read loop, so the disconnect
+	// and the lost row arrive together, and an agent killed mid-stream is the case
+	// most worth recording. Bounded so a stuck write cannot outlive shutdown.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	if err := saveRequest(ctx, pool, rec); err != nil {
 		slog.Error("failed to save request record", "err", err)
 	}
@@ -122,7 +131,7 @@ func recordRequest(ctx context.Context, rec requestRecord, record bool) {
 // is indexable: every path either 404s or needs a customer's API key.
 func robotsHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, "User-agent: *\nDisallow: /\n")
+	_, _ = io.WriteString(w, "User-agent: *\nDisallow: /\n")
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -209,9 +218,17 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	var reqParsed requestBody
-	json.Unmarshal(reqBytes, &reqParsed) // best-effort; bad JSON leaves Model empty
+	_ = json.Unmarshal(reqBytes, &reqParsed) // best-effort; bad JSON leaves Model empty
 
-	proxyReq, err := http.NewRequest(r.Method, providers[provider]+forwardPath, bytes.NewReader(reqBytes))
+	// r.URL.Path drops the query string, so it has to be carried over separately
+	// or parameterised endpoints (pagination, list filters) silently reach the
+	// provider asking a different question than the caller did.
+	upstreamURL := providers[provider] + forwardPath
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	proxyReq, err := http.NewRequest(r.Method, upstreamURL, bytes.NewReader(reqBytes))
 	if err != nil {
 		saveFailure(r, projectKey, provider, start, reqParsed.Model, http.StatusInternalServerError, "failed to build upstream request", q.Record)
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
@@ -249,7 +266,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var respParsed responseBody
-	json.Unmarshal(respBytes, &respParsed) // best-effort; an unparseable body leaves zero tokens
+	_ = json.Unmarshal(respBytes, &respParsed) // best-effort; an unparseable body leaves zero tokens
 	inputTokens, outputTokens := respParsed.tokens()
 
 	for k, v := range resp.Header {
