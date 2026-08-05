@@ -41,19 +41,19 @@ you.
 You don't need to read the whole thing. Three spots decide whether this claim
 actually holds:
 
-- `logRequest` in `main.go`, the only place in the program that logs anything
-  per-request. It takes a `logEntry` struct with a fixed set of fields and
-  hands them to `slog` one at a time. There's no `body` field on that struct,
-  and nothing logs `reqBytes` or `respBytes`.
+- `logRequest` in `main.go`, the one log line that describes a request. It
+  takes a `logEntry` struct with a fixed set of fields and hands them to `slog`
+  one at a time. There's no `body` field on that struct. The other `slog` calls
+  in here are startup and error lines, and if you grep all of them you won't
+  find `reqBytes` or `respBytes` in any.
 - `saveRequest` in `db.go`, the only `INSERT` in the codebase. The column list
-  is spelled out by hand, eleven columns, none of them hold content.
+  is written out by hand, thirteen of them, and none hold content.
 - `schema.sql`, the table those columns land in. There's nowhere to even put a
   body if some future change tried to sneak one in.
 
 The bodies do exist, briefly, as `reqBytes` and `respBytes` in `handler`. Grep
-for them if you want: they get read, parsed for `model` and token usage,
-forwarded upstream, and dropped. That's the entire lifecycle and it's about
-thirty lines of code.
+for those two names if you want. They get read, parsed for `model` and token
+counts, forwarded upstream, and dropped. That's the whole life of them.
 
 Streaming works the same way. `streamResponse` writes each SSE line straight
 through to your client, then parses its own local copy afterward to pull token
@@ -106,7 +106,7 @@ psql vergilant -c "UPDATE projects SET monthly_request_limit = 0 WHERE key = 'bu
 ```
 
 `NULL`, the default, means "use the env value". Changes take up to 45 seconds
-to take effect - see the key cache note in `keycache.go`.
+to show up, because of the key cache in `keycache.go`.
 
 ### What actually happens when a project goes over
 
@@ -130,9 +130,9 @@ is only there so a free tier can't be used as an unlimited relay forever.
 An account that has finished two months in a row over its limit loses the
 middle row, so recording stops at the limit itself. Forwarding is unchanged for
 them, right up to the same 4x ceiling. That count is
-`users.consecutive_cap_months`. Nothing in this module writes it, so set it
-from whatever handles your billing, or ignore the table entirely and leave
-`projects.user_id` NULL - a project with no owner gets the full grace window.
+`users.consecutive_cap_months`. Nothing in here writes it, so set it from
+whatever handles your billing, or ignore the table completely and leave
+`projects.user_id` NULL. A project with no owner gets the full grace window.
 
 The multipliers are plain constants in `quota/quota.go`.
 
@@ -147,14 +147,14 @@ ERROR refusing to start
 ```
 
 That's one message at boot instead of a 500 on every request. The list it
-checks is `requiredColumns` in `schema_check.go` - short, and worth a glance if
-you've customized the schema.
+checks is `requiredColumns` in `schema_check.go`. It's short, and worth a look
+if you've changed the schema.
 
-The `schema.sql` in this repo is the proxy's own, covering only the three
-tables it touches, and you apply it yourself. The hosted Vergilant service runs these
-same tables under an ordered migration runner; this check and that runner are
-separate mechanisms, so if you are running the full service, a missing column
-means a migration hasn't run - applying this file over it is the wrong fix.
+The `schema.sql` here is the proxy's own and only covers the three tables it
+touches. You apply it yourself. If you're running the full hosted service
+instead, it keeps these same tables under a migration runner, so a missing
+column there means a migration hasn't run and applying this file over it is the
+wrong fix.
 
 There's also an in-memory per-project rate limiter (30 burst, 10/sec
 sustained) as a basic abuse guardrail. It lives in `ratelimit.go` as plain
@@ -187,10 +187,10 @@ It's at [vergilant.dev](https://vergilant.dev). Free tier is one project and
 
 ## Questions
 
-There's a Discord: https://discord.gg/cu2PrGeJH6
+Open an issue, that's the easiest way to reach me. There's also a Discord if
+you'd rather: https://discord.gg/cu2PrGeJH6
 
-Self-hosting questions are as welcome there as hosted ones. If you'd rather
-not use Discord, open an issue.
+Self-hosting questions are as welcome as hosted ones, either way.
 
 ## Contributing
 
