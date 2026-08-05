@@ -87,7 +87,7 @@ you'll see a row show up in `requests`.
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | yes | | Postgres connection string. |
-| `MONTHLY_REQUEST_LIMIT` | no | `10000` | Requests per project per calendar month. Set to `0` to disable the cap. |
+| `MONTHLY_REQUEST_LIMIT` | no | `5000` | Requests per project per calendar month. Set to `0` to disable the cap. |
 | `MAX_REQUEST_BYTES` | no | `26214400` (25 MiB) | Largest request body it'll accept. |
 
 Drop a `.env` file in the working directory and it'll get picked up
@@ -181,6 +181,16 @@ Hosted Vergilant is this proxy plus a dashboard over the `requests` table and
 an alert engine that pings you on Discord when error rates spike, spend
 jumps, or your traffic goes quiet. If you'd rather self-host and just query
 the table yourself, that's a perfectly normal thing to do and it's supported.
+
+It's at [vergilant.dev](https://vergilant.dev). Free tier is one project and
+5k requests a month, with all three alert types.
+
+## Questions
+
+There's a Discord: https://discord.gg/cu2PrGeJH6
+
+Self-hosting questions are as welcome there as hosted ones. If you'd rather
+not use Discord, open an issue.
 
 ## Contributing
 

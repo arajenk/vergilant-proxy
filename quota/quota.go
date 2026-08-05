@@ -29,7 +29,7 @@ const (
 	// The cap for a project storing no override. Overridable per deployment via
 	// MONTHLY_REQUEST_LIMIT, but the free plan, the dashboard meter and the
 	// notice emails all have to agree on this number.
-	DefaultFreeMonthlyLimit = 10000
+	DefaultFreeMonthlyLimit = 5000
 )
 
 // State is the decision for one request.
