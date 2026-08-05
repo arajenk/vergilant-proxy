@@ -7,33 +7,32 @@ import (
 	"time"
 )
 
-// Two independent layers limit a project. The monthly cap is durable and lives
-// in Postgres (see monthlyLimit and projectStatus). The token bucket below is an
-// in-memory guardrail against pathological bursts, like a runaway agent looping
-// thousands of times a second; losing it on restart is harmless. It is not the
-// customer-facing limit, so it is set generously.
+// Two different limits. The monthly cap is the real one and lives in Postgres.
+// The bucket below just catches silly bursts, like an agent looping thousands of
+// times a second. In memory, and losing it on restart is fine.
 const (
 	burstSize       = 30
 	refillPerSecond = 10
 )
 
-// Set from MONTHLY_REQUEST_LIMIT at startup, 0 to disable. This is the default
-// for projects with no monthly_request_limit of their own.
+// Set from MONTHLY_REQUEST_LIMIT at startup, 0 turns the cap off. This is the
+// default for projects with no limit of their own.
 var monthlyLimit int = quota.DefaultFreeMonthlyLimit
 
-// Fractional tokens, so a partial refill between requests is not rounded away.
+// Fractional tokens so a partial refill between requests isn't rounded away.
 type bucket struct {
 	tokens float64
 	last   time.Time
 }
 
-// Only holds keys that passed validation, since allow runs after projectStatus,
-// so it is bounded by the number of real projects and needs no reaper.
+// Only holds keys that already passed validation, since allow runs after
+// projectStatus. So it's bounded by the number of real projects and nothing
+// needs to clean it up.
 type limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
 	rate    float64 // tokens added per second
-	burst   float64 // ceiling on accumulated tokens
+	burst   float64 // most tokens you can bank
 }
 
 func newLimiter(rate, burst float64) *limiter {
@@ -44,8 +43,8 @@ func newLimiter(rate, burst float64) *limiter {
 	}
 }
 
-// allow reports whether the project may make one more request, spending a token
-// if so.
+// allow says whether the project can make one more request, and spends a token
+// if it can.
 func (l *limiter) allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -53,7 +52,7 @@ func (l *limiter) allow(key string) bool {
 	now := time.Now()
 	b := l.buckets[key]
 	if b == nil {
-		// Start full, so a new project is not throttled immediately.
+		// Start full so a new project isn't throttled straight away.
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	}

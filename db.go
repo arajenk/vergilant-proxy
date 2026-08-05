@@ -10,17 +10,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// USD per million tokens, matching how providers publish pricing.
+// USD per million tokens, the way providers publish it.
 type modelPrice struct {
 	InputPerMillion  float64
 	OutputPerMillion float64
 }
 
-// Maintained by hand. A missing model costs $0; see estimatedCost.
-//
-// Claude rows verified against platform.claude.com/docs/en/about-claude/pricing
-// on 2026-07-28. Sonnet 5 is on introductory pricing until 2026-08-31, then
-// reverts to $3/$15. The OpenAI rows are unverified.
+// Kept by hand. A model that isn't in here costs $0, see estimatedCost. Claude
+// rows checked against Anthropic's pricing page on 2026-07-28, Sonnet 5 on intro
+// pricing until 2026-08-31. The OpenAI rows haven't been checked.
 var priceMap = map[string]modelPrice{
 	"claude-fable-5":            {InputPerMillion: 10, OutputPerMillion: 50},
 	"claude-opus-5":             {InputPerMillion: 5, OutputPerMillion: 25},
@@ -37,14 +35,15 @@ var priceMap = map[string]modelPrice{
 	"o3-mini":      {InputPerMillion: 1.1, OutputPerMillion: 4.4},
 }
 
-// Models already warned about, so each produces one log line rather than one
-// per request.
+// Models we've already warned about, so each one logs once instead of on every
+// request.
 var (
 	unpricedMu   sync.Mutex
 	unpricedSeen = map[string]bool{}
 )
 
-// Logs the model name only, which is metadata like every other field recorded.
+// Logs the model name and nothing else, which is metadata like everything else
+// we keep.
 func warnUnpricedOnce(model string) {
 	unpricedMu.Lock()
 	defer unpricedMu.Unlock()
@@ -60,9 +59,10 @@ func warnUnpricedOnce(model string) {
 func estimatedCost(model string, inputTokens, outputTokens int) float64 {
 	price, ok := priceMap[model]
 	if !ok {
-		// Zero rather than a guess, since an invented price corrupts every cost
-		// number downstream. Zero is not harmless either: cost_spike compares
-		// spend against a baseline, and 0 never exceeds 5x0. Hence the warning.
+		// Zero instead of a guess, because a made up price poisons every cost
+		// number after it. Zero isn't harmless either: the cost alert compares
+		// spend to a baseline, and 0 never beats 5x0. That's what the warning is
+		// for.
 		warnUnpricedOnce(model)
 		return 0
 	}
@@ -77,9 +77,9 @@ type requestRecord struct {
 	Model      string
 	Status     int
 	LatencyMs  int64
-	// The split of LatencyMs: the key lookup, and the provider's time. Pointers
-	// because a request that failed before either stage has no number to report,
-	// and a zero would read as "added nothing" rather than "not measured".
+	// LatencyMs split up: the key lookup, and the provider's own time. Pointers
+	// because a request that died before either step has no number to give, and
+	// a 0 would read as "took no time" instead of "never measured".
 	ValidateMs       *int64
 	UpstreamMs       *int64
 	FirstTokenMs     *int64
@@ -94,8 +94,8 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	// pgxpool.New does not connect eagerly, so ping to fail at startup rather
-	// than on the first proxied request.
+	// pgxpool.New doesn't actually connect, so ping here to fail at startup
+	// instead of on someone's first request.
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -103,17 +103,12 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// One round-trip on the hot path. The month count comes from the requests table
-// rather than a counter, so there is nothing to keep in sync; the
-// (project_key, timestamp) index keeps it a cheap range count. Postgres now() is
-// UTC, so date_trunc gives a UTC month boundary.
+// One round trip on the hot path. The month count comes off the requests table
+// rather than a counter, so there's nothing to keep in sync, and the
+// (project_key, timestamp) index makes it cheap.
 //
-// An unknown key returns pgx.ErrNoRows. limit is nil for a NULL column, meaning
-// "use monthlyLimit", which the caller resolves. capMonths is the owner's
-// consecutive whole months over cap, which the quota package reads.
-//
-// LEFT JOIN and COALESCE because projects.user_id is nullable: an unowned
-// project has no history, same as a clean one.
+// Unknown key gives pgx.ErrNoRows. limit is nil when the column is NULL, meaning
+// use monthlyLimit. LEFT JOIN because projects.user_id can be NULL.
 func projectStatus(ctx context.Context, pool *pgxpool.Pool, key string) (limit *int, monthCount, capMonths int, err error) {
 	err = pool.QueryRow(ctx, `
 		SELECT

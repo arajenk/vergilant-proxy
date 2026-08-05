@@ -6,16 +6,16 @@ import (
 	"time"
 )
 
-// A new provider needs an entry here, price rows in db.go, and an SSE line
-// parser below if it streams.
+// Adding a provider takes an entry here, price rows in db.go, and an SSE parser
+// below if it streams.
 var providers = map[string]string{
 	"anthropic": "https://api.anthropic.com",
 	"openai":    "https://api.openai.com",
 }
 
 // splitProviderPath turns "/openai/v1/chat/completions" into
-// ("openai", "/v1/chat/completions", true). ok is false for an unknown provider
-// or a path with no second segment.
+// ("openai", "/v1/chat/completions", true). ok is false for a provider we don't
+// know or a path with nothing after it.
 func splitProviderPath(path string) (provider, rest string, ok bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	provider, rest, found := strings.Cut(trimmed, "/")
@@ -28,9 +28,8 @@ func splitProviderPath(path string) (provider, rest string, ok bool) {
 	return provider, "/" + rest, true
 }
 
-// Anthropic names each event on an "event:" line and puts its payload on the
-// following "data:" line, so currentEvent tracks which event that data belongs
-// to.
+// Anthropic puts the event name on an "event:" line and the payload on the
+// "data:" line after it, so currentEvent tracks which event the data belongs to.
 func parseAnthropicSSELine(text string, currentEvent *string, inputTokens, outputTokens *int, firstTokenAt *time.Time) {
 	switch {
 	case strings.HasPrefix(text, "event:"):
@@ -66,14 +65,13 @@ func parseAnthropicSSELine(text string, currentEvent *string, inputTokens, outpu
 			}
 		}
 	case text == "":
-		*currentEvent = "" // blank line = SSE event boundary
+		*currentEvent = "" // blank line ends an SSE event
 	}
 }
 
-// OpenAI has no "event:" line: every line is a bare "data: {...}" chunk, ending
-// with "data: [DONE]". Usage appears only in the last chunk, and only if the
-// request set stream_options.include_usage, so requests without it report zero
-// tokens.
+// OpenAI has no "event:" line. Every line is just "data: {...}", finishing with
+// "data: [DONE]". Usage only shows up in the last chunk, and only if the request
+// set stream_options.include_usage, so requests without it report zero tokens.
 func parseOpenAISSELine(text string, inputTokens, outputTokens *int, firstTokenAt *time.Time) {
 	if !strings.HasPrefix(text, "data:") {
 		return
