@@ -124,6 +124,39 @@ func recordRequest(ctx context.Context, rec requestRecord, record bool) {
 	}
 }
 
+// Hop-by-hop headers describe one leg of a connection instead of the message
+// itself, so RFC 7230 section 6.1 says a proxy drops them rather than passing
+// them on. Anthropic and OpenAI are plain HTTP and SSE, so nothing here wants
+// an Upgrade either.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	// Not in the RFC, but plenty of clients send it and it means the same thing.
+	"Proxy-Connection",
+	"Te", // canonicalized "TE"
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// stripHopByHop deletes the list above plus whatever the sender named in its own
+// Connection header, which is how that rule gets extended per connection.
+// Connection has to be read before it's deleted, so that loop goes first.
+func stripHopByHop(h http.Header) {
+	for _, v := range h.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+}
+
 // Crawlers find this host through the vergilant.dev domain. There's nothing to
 // index: every path either 404s or needs someone's API key.
 func robotsHandler(w http.ResponseWriter, _ *http.Request) {
@@ -233,6 +266,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// Cloning passes their provider key straight through, which is the point.
 	// This one is ours though and shouldn't end up in a provider's logs.
 	proxyReq.Header.Del("X-Monitor-Key")
+	// Cloning also copies the headers that belonged to the caller's connection
+	// to us, which have no meaning on our connection to the provider.
+	stripHopByHop(proxyReq.Header)
 	// Ask for plaintext so the streaming code can read SSE lines. Go only
 	// decompresses gzip for you when it set Accept-Encoding itself, so a value
 	// from the client would leave resp.Body as raw gzip.
@@ -247,6 +283,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	upstreamMs := time.Since(upstreamStart).Milliseconds()
+
+	// Both paths below copy these headers to the caller verbatim, so clean them
+	// once here rather than in each. The provider's connection ends at us.
+	stripHopByHop(resp.Header)
 
 	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
 		streamResponse(w, r, resp, start, reqParsed, projectKey, provider, validateMs, upstreamMs, cached, q.Record)

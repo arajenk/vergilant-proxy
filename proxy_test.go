@@ -946,3 +946,77 @@ func TestMetadataIsRecordedEvenIfTheCallerDisconnects(t *testing.T) {
 		t.Errorf("recorded %d rows, want 1 - metadata lost because the caller hung up", n)
 	}
 }
+
+// Hop-by-hop headers describe one leg of a connection, not the message, so RFC
+// 7230 section 6.1 says a proxy must not pass them on. The request headers are
+// cloned wholesale and the response headers copied back the same way, so both
+// directions leak them - along with anything the sender named in its own
+// Connection header, which is the extensible half of the same rule.
+func TestHopByHopHeadersAreNotForwardedUpstream(t *testing.T) {
+	resetDB(t)
+	seedProject(t, "lm_hop_req")
+
+	var got http.Header
+	stubUpstream(t, "anthropic", func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, anthropicReply)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages",
+		strings.NewReader(`{"model":"claude-sonnet-5"}`))
+	req.Header.Set("X-Monitor-Key", "lm_hop_req")
+	req.Header.Set("x-api-key", "sk-ant-customer-key")
+	// Named in Connection, so it is hop-by-hop for this connection only.
+	req.Header.Set("Connection", "Keep-Alive, X-Hop-Scoped")
+	req.Header.Set("Keep-Alive", "timeout=5, max=1000")
+	req.Header.Set("X-Hop-Scoped", "should-not-survive")
+	req.Header.Set("Proxy-Authorization", "Basic bm90LXlvdXJz")
+	req.Header.Set("TE", "trailers")
+
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+
+	for _, h := range []string{"Connection", "Keep-Alive", "X-Hop-Scoped", "Proxy-Authorization", "TE"} {
+		if v := got.Get(h); v != "" {
+			t.Errorf("upstream received hop-by-hop header %s: %q", h, v)
+		}
+	}
+	// The end-to-end headers still have to arrive, or stripping has gone too far.
+	if v := got.Get("x-api-key"); v != "sk-ant-customer-key" {
+		t.Errorf("x-api-key = %q, want the caller's key forwarded untouched", v)
+	}
+}
+
+func TestHopByHopHeadersFromUpstreamAreNotReturnedToTheCaller(t *testing.T) {
+	resetDB(t)
+	seedProject(t, "lm_hop_resp")
+
+	stubUpstream(t, "anthropic", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "Keep-Alive, X-Upstream-Hop")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("X-Upstream-Hop", "should-not-survive")
+		w.Header().Set("Proxy-Authenticate", "Basic realm=\"upstream\"")
+		w.Header().Set("Anthropic-Version", "2023-06-01")
+		io.WriteString(w, anthropicReply)
+	})
+
+	rec := post(t, "/anthropic/v1/messages", "lm_hop_resp", `{"model":"claude-sonnet-5"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+
+	for _, h := range []string{"Connection", "Keep-Alive", "X-Upstream-Hop", "Proxy-Authenticate"} {
+		if v := rec.Header().Get(h); v != "" {
+			t.Errorf("caller received hop-by-hop header %s: %q", h, v)
+		}
+	}
+	// A provider header that is genuinely end-to-end still has to reach the caller.
+	if v := rec.Header().Get("Anthropic-Version"); v != "2023-06-01" {
+		t.Errorf("Anthropic-Version = %q, want it passed through", v)
+	}
+}
