@@ -1,0 +1,58 @@
+# Postgres with schema.sql already applied, and the proxy pointed at it. Enough
+# to try the thing end to end:
+#
+#   docker compose up --build -d
+#   docker compose exec db psql -U vergilant -d vergilant \
+#     -c "INSERT INTO projects (key, name) VALUES ('dev-key', 'local')"
+#
+# Then send a call through it, with your own provider key:
+#
+#   curl http://localhost:8080/anthropic/v1/messages \
+#     -H "X-Monitor-Key: dev-key" \
+#     -H "x-api-key: $ANTHROPIC_API_KEY" \
+#     -H "anthropic-version: 2023-06-01" \
+#     -H "content-type: application/json" \
+#     -d '{"model":"claude-sonnet-5","max_tokens":16,
+#          "messages":[{"role":"user","content":"ping"}]}'
+#
+# and the row it wrote:
+#
+#   docker compose exec db psql -U vergilant -d vergilant -c "SELECT * FROM requests"
+#
+# The credentials below are local only. Set a real DATABASE_URL if you point
+# this at a database you care about.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vergilant
+      POSTGRES_PASSWORD: vergilant
+      POSTGRES_DB: vergilant
+    # Init scripts run once, against an empty data directory. To re-apply after
+    # editing schema.sql: docker compose down -v.
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vergilant -d vergilant"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  proxy:
+    build: .
+    environment:
+      DATABASE_URL: postgres://vergilant:vergilant@db:5432/vergilant?sslmode=disable
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    # Waiting on the port is not enough. The proxy checks at startup that every
+    # column it reads exists and exits if one is missing, so it has to come up
+    # after the init script has finished, not just after Postgres is listening.
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

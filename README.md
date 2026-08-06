@@ -69,6 +69,36 @@ reads one.
 
 ## Running it
 
+### With Docker
+
+`docker-compose.yml` brings up Postgres with `schema.sql` already applied, and
+the proxy pointed at it.
+
+```sh
+docker compose up --build -d
+docker compose exec db psql -U vergilant -d vergilant \
+  -c "INSERT INTO projects (key, name) VALUES ('dev-key', 'local')"
+```
+
+That's it. It listens on `:8080`.
+
+```sh
+curl http://localhost:8080/anthropic/v1/messages \
+  -H "X-Monitor-Key: dev-key" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5","max_tokens":16,
+       "messages":[{"role":"user","content":"ping"}]}'
+
+docker compose exec db psql -U vergilant -d vergilant -c "SELECT * FROM requests"
+```
+
+The credentials in the compose file are local only. Point `DATABASE_URL` at
+your own Postgres if you'd rather use one you already run.
+
+### Without Docker
+
 You'll need Postgres and Go 1.26+.
 
 ```sh
